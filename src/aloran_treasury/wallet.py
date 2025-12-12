@@ -73,6 +73,19 @@ LAMPORTS_PER_SOL = 1_000_000_000
 
 
 @dataclass
+class TransactionHistoryEntry:
+    """Lightweight representation of a historical transaction."""
+
+    signature: str
+    slot: int
+    block_time: Optional[int]
+    amount: float
+    kind: Literal["SOL", "Token"]
+    success: bool
+    error: Optional[str] = None
+
+
+@dataclass
 class TransferRequest:
     """Single transfer entry used by the UI and controller."""
 
@@ -112,6 +125,7 @@ class WalletState:
     token_program: TokenProgram = "Token-2022"
     public_key: Optional[str] = None
     sol_balance: Optional[float] = None
+    active_mint: Optional[str] = None
     locked: bool = True
     pending_actions: list[str] = field(default_factory=list)
     associated_accounts: dict[Network, list["AssociatedTokenAccount"]] = field(
@@ -143,6 +157,11 @@ class WalletState:
         """Persist the user's chosen token program for ATA previews."""
 
         self.token_program = token_program
+
+    def set_active_mint(self, mint: Optional[str]) -> None:
+        """Track the mint currently in focus for history lookups."""
+
+        self.active_mint = mint
 
     def associated_accounts_for_network(self, network: Optional[Network] = None) -> list[
         AssociatedTokenAccount
@@ -303,6 +322,7 @@ class WalletController:
 
         existing = self.list_associated_accounts(mint)
         if existing:
+            self.state.set_active_mint(mint)
             return existing[0]
 
         # Generate a placeholder PDA-like address for previews.
@@ -313,6 +333,7 @@ class WalletController:
             token_program=self.state.token_program,
         )
         self.state.add_associated_account(account)
+        self.state.set_active_mint(mint)
         return account
 
     def close_associated_account(
@@ -330,6 +351,16 @@ class WalletController:
         remaining = [ata for ata in accounts if ata.address != ata_address]
         self.state.replace_associated_accounts(remaining)
         return match, match.rent_lamports
+
+    def active_token_account(self, mint: Optional[str] = None) -> Optional[AssociatedTokenAccount]:
+        """Return the ATA matching the provided or active mint, if tracked."""
+
+        target_mint = mint or self.state.active_mint
+        if not target_mint:
+            return None
+
+        accounts = self.list_associated_accounts(target_mint)
+        return accounts[0] if accounts else None
 
     def transfer(
         self,
@@ -413,6 +444,201 @@ class WalletController:
                     )
                 )
         return results
+
+    def fetch_history(
+        self,
+        mint: Optional[str] = None,
+        before: Optional[str] = None,
+        limit: int = 20,
+    ) -> tuple[list[TransactionHistoryEntry], Optional[str]]:
+        """Fetch combined SOL and token history for the active wallet.
+
+        Results are scoped to the wallet's SOL address and, when provided,
+        the associated token account for the mint. The cursor returned can be
+        passed back via ``before`` for pagination.
+        """
+
+        if self._keypair is None:
+            raise RuntimeError("No keypair is loaded")
+
+        owner_address = str(self._keypair.pubkey())
+        token_account = self.active_token_account(mint)
+
+        endpoint = self.select_endpoint()
+        client = Client(endpoint.url)
+        try:
+            addresses = [owner_address]
+            if token_account:
+                addresses.append(token_account.address)
+
+            signatures: dict[str, int] = {}
+            for address in addresses:
+                response = client.get_signatures_for_address(
+                    Pubkey.from_string(address), limit=limit, before=before
+                )
+                for info in response.value:
+                    signatures[str(info.signature)] = info.slot
+
+            sorted_sigs = sorted(
+                signatures.items(), key=lambda item: item[1], reverse=True
+            )
+            entries: list[TransactionHistoryEntry] = []
+            for signature, _ in sorted_sigs[:limit]:
+                entries.extend(
+                    self._parse_transaction(
+                        client, signature, owner_address, token_account
+                    )
+                )
+
+            cursor = sorted_sigs[limit - 1][0] if len(sorted_sigs) >= limit else None
+            self._mark_endpoint_healthy(endpoint)
+            return entries, cursor
+        except Exception:
+            self.mark_endpoint_failed(endpoint)
+            raise
+
+    def _parse_transaction(
+        self,
+        client: Client,
+        signature: str,
+        owner_address: str,
+        token_account: Optional[AssociatedTokenAccount],
+    ) -> list[TransactionHistoryEntry]:
+        """Parse a transaction into SOL and token history entries."""
+
+        response = client.get_transaction(signature, encoding="jsonParsed")
+        value = response.value
+        if value is None:
+            return []
+
+        meta = value.get("meta", {}) if isinstance(value, dict) else {}
+        transaction = value.get("transaction", {}) if isinstance(value, dict) else {}
+        account_keys = self._normalize_account_keys(
+            transaction.get("message", {}).get("accountKeys", [])
+        )
+        slot = int(value.get("slot", 0)) if isinstance(value, dict) else 0
+        block_time = value.get("blockTime") if isinstance(value, dict) else None
+        err = meta.get("err") if isinstance(meta, dict) else None
+        success = err is None
+
+        entries: list[TransactionHistoryEntry] = []
+
+        sol_change = self._extract_sol_change(meta, account_keys, owner_address)
+        if sol_change is not None:
+            entries.append(
+                TransactionHistoryEntry(
+                    signature=signature,
+                    slot=slot,
+                    block_time=block_time,
+                    amount=sol_change,
+                    kind="SOL",
+                    success=success,
+                    error=str(err) if err else None,
+                )
+            )
+
+        token_change = self._extract_token_change(
+            meta, account_keys, token_account
+        )
+        if token_change is not None:
+            entries.append(
+                TransactionHistoryEntry(
+                    signature=signature,
+                    slot=slot,
+                    block_time=block_time,
+                    amount=token_change,
+                    kind="Token",
+                    success=success,
+                    error=str(err) if err else None,
+                )
+            )
+
+        return entries
+
+    def _extract_sol_change(
+        self, meta: dict, account_keys: list[str], owner_address: str
+    ) -> Optional[float]:
+        """Return the SOL delta for the wallet within a transaction."""
+
+        try:
+            index = account_keys.index(owner_address)
+        except ValueError:
+            return None
+
+        pre = meta.get("preBalances", []) if isinstance(meta, dict) else []
+        post = meta.get("postBalances", []) if isinstance(meta, dict) else []
+        if len(pre) <= index or len(post) <= index:
+            return None
+
+        return (post[index] - pre[index]) / LAMPORTS_PER_SOL
+
+    def _extract_token_change(
+        self,
+        meta: dict,
+        account_keys: list[str],
+        token_account: Optional[AssociatedTokenAccount],
+    ) -> Optional[float]:
+        """Return the token delta for the provided ATA within a transaction."""
+
+        if token_account is None:
+            return None
+
+        try:
+            index = account_keys.index(token_account.address)
+        except ValueError:
+            return None
+
+        pre_balances = (
+            {balance.get("accountIndex"): balance}
+            for balance in meta.get("preTokenBalances", [])
+            if isinstance(meta, dict)
+        )
+        post_balances = (
+            {balance.get("accountIndex"): balance}
+            for balance in meta.get("postTokenBalances", [])
+            if isinstance(meta, dict)
+        )
+
+        pre_map: dict[int, dict] = {}
+        for entry in pre_balances:
+            pre_map.update(entry)
+        post_map: dict[int, dict] = {}
+        for entry in post_balances:
+            post_map.update(entry)
+
+        pre_amount = self._token_amount_from_balance(pre_map.get(index))
+        post_amount = self._token_amount_from_balance(post_map.get(index))
+        if pre_amount is None or post_amount is None:
+            return None
+
+        return post_amount - pre_amount
+
+    def _token_amount_from_balance(self, balance: Optional[dict]) -> Optional[float]:
+        """Normalize a token balance entry into a float amount."""
+
+        if not balance:
+            return 0.0
+
+        amount_str = balance.get("uiTokenAmount", {}).get("amount")
+        decimals = balance.get("uiTokenAmount", {}).get("decimals")
+        if amount_str is None or decimals is None:
+            return None
+
+        try:
+            return int(amount_str) / (10 ** int(decimals))
+        except (ValueError, TypeError):
+            return None
+
+    def _normalize_account_keys(self, keys: list) -> list[str]:
+        """Convert account keys to a list of base58 strings."""
+
+        normalized: list[str] = []
+        for key in keys:
+            if isinstance(key, dict) and "pubkey" in key:
+                normalized.append(str(key.get("pubkey")))
+            else:
+                normalized.append(str(key))
+        return normalized
 
     def _apply_keypair(self, keypair: Keypair) -> None:
         self._keypair = keypair

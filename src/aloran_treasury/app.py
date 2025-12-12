@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import csv
+from datetime import datetime
 from pathlib import Path
 import sys
 from typing import Iterable, List, Optional
 
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtCore import QUrl
+from PySide6.QtGui import QColor, QDesktopServices, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -39,6 +41,7 @@ from .wallet import (
     NETWORKS,
     AssociatedTokenAccount,
     TokenProgram,
+    TransactionHistoryEntry,
     TransferRequest,
     WalletController,
     WalletState,
@@ -283,6 +286,8 @@ class TreasuryConsole(QWidget):
         self.setWindowTitle("Aloran Treasury Console (Prototype)")
         self.setMinimumSize(720, 720)
         self.failed_transfers: list[tuple[TransferRequest, Optional[float]]] = []
+        self.history_entries: list[TransactionHistoryEntry] = []
+        self.history_cursor: Optional[str] = None
         self._build()
         self._refresh_ata_table()
 
@@ -295,6 +300,7 @@ class TreasuryConsole(QWidget):
         layout.addLayout(self._network_row())
         layout.addLayout(self._wallet_card())
         layout.addLayout(self._actions_grid())
+        layout.addLayout(self._history_panel())
         layout.addLayout(self._activity_panel())
         self.setLayout(layout)
 
@@ -452,6 +458,68 @@ class TreasuryConsole(QWidget):
 
         return grid
 
+    def _history_panel(self) -> QVBoxLayout:
+        column = QVBoxLayout()
+        title = QLabel("Transaction History")
+        title.setStyleSheet("font-size: 14pt; font-weight: 700;")
+        helper = QLabel(
+            muted(
+                "Fetch recent SOL and active mint activity with filters for quick triage."
+            )
+        )
+
+        filter_row = QHBoxLayout()
+        type_label = QLabel("Asset")
+        type_label.setObjectName("muted")
+        type_filter = QComboBox()
+        type_filter.addItems(["All", "SOL", "Token"])
+        type_filter.currentTextChanged.connect(self._render_history_table)
+        self.history_type_filter = type_filter
+
+        status_label = QLabel("Status")
+        status_label.setObjectName("muted")
+        status_filter = QComboBox()
+        status_filter.addItems(["All", "Success", "Error"])
+        status_filter.currentTextChanged.connect(self._render_history_table)
+        self.history_status_filter = status_filter
+
+        refresh_button = QPushButton("Refresh")
+        refresh_button.clicked.connect(lambda: self._load_history(False))
+        load_more_button = QPushButton("Load more")
+        load_more_button.setEnabled(False)
+        load_more_button.clicked.connect(lambda: self._load_history(True))
+        self.history_load_more_button = load_more_button
+
+        filter_row.addWidget(type_label)
+        filter_row.addWidget(type_filter)
+        filter_row.addSpacing(12)
+        filter_row.addWidget(status_label)
+        filter_row.addWidget(status_filter)
+        filter_row.addStretch()
+        filter_row.addWidget(refresh_button)
+        filter_row.addWidget(load_more_button)
+
+        mint_row = QHBoxLayout()
+        mint_label = QLabel(self._active_mint_line())
+        mint_label.setObjectName("muted")
+        self.active_mint_label = mint_label
+        mint_row.addWidget(mint_label)
+        mint_row.addStretch()
+
+        table = QTableWidget(0, 6)
+        table.setHorizontalHeaderLabels(
+            ["Type", "Amount", "Result", "Signature", "Timestamp", "Actions"]
+        )
+        table.horizontalHeader().setStretchLastSection(True)
+        self.history_table = table
+
+        column.addWidget(title)
+        column.addWidget(helper)
+        column.addLayout(filter_row)
+        column.addLayout(mint_row)
+        column.addWidget(table)
+        return column
+
     def _activity_panel(self) -> QVBoxLayout:
         column = QVBoxLayout()
         label = QLabel("Recent Activity")
@@ -493,6 +561,10 @@ class TreasuryConsole(QWidget):
         program = self.wallet_state.token_program
         return f"ATAs on {self.wallet_state.network}: {count} · Program: {program}"
 
+    def _active_mint_line(self) -> str:
+        mint = self.wallet_state.active_mint
+        return f"Active mint: {mint}" if mint else "Active mint: none selected"
+
     def _signature_url(self, signature: str) -> str:
         cluster = self.wallet_state.network.lower()
         cluster_param = "" if cluster == "mainnet" else f"?cluster={cluster}"
@@ -513,6 +585,89 @@ class TreasuryConsole(QWidget):
             self.ata_table.setItem(row, 4, QTableWidgetItem(f"{reclaim_sol:.6f}"))
 
         self.ata_summary_label.setText(self._ata_summary_line())
+        self.active_mint_label.setText(self._active_mint_line())
+
+    def _load_history(self, load_more: bool = False) -> None:
+        if self.wallet_state.locked or not self.wallet_state.public_key:
+            self._show_error(
+                "Wallet locked", "Import or generate a keypair before fetching history."
+            )
+            return
+
+        cursor = self.history_cursor if load_more else None
+        try:
+            entries, cursor = self.wallet_controller.fetch_history(
+                mint=self.wallet_state.active_mint, before=cursor, limit=10
+            )
+        except Exception as exc:  # noqa: BLE001 - surface RPC errors
+            self._show_error("History unavailable", str(exc))
+            return
+
+        if load_more:
+            self.history_entries.extend(entries)
+        else:
+            self.history_entries = entries
+
+        self.history_cursor = cursor
+        self.history_load_more_button.setEnabled(cursor is not None)
+        self._render_history_table()
+
+    def _render_history_table(self) -> None:
+        filtered = []
+        asset_filter = self.history_type_filter.currentText()
+        status_filter = self.history_status_filter.currentText()
+
+        for entry in self.history_entries:
+            if asset_filter != "All" and entry.kind != asset_filter:
+                continue
+            if status_filter == "Success" and not entry.success:
+                continue
+            if status_filter == "Error" and entry.success:
+                continue
+            filtered.append(entry)
+
+        self.history_table.setRowCount(len(filtered))
+        for row, entry in enumerate(filtered):
+            amount_unit = "SOL" if entry.kind == "SOL" else "tokens"
+            amount = QTableWidgetItem(f"{entry.amount:+.6f} {amount_unit}")
+            result_text = "Success" if entry.success else "Error"
+            if entry.error:
+                result_text = f"{result_text}: {entry.error}"
+            signature_text = f"{entry.signature[:8]}…{entry.signature[-4:]}"
+            timestamp = (
+                datetime.fromtimestamp(entry.block_time).strftime("%Y-%m-%d %H:%M:%S")
+                if entry.block_time
+                else "Unknown"
+            )
+
+            self.history_table.setItem(row, 0, QTableWidgetItem(entry.kind))
+            self.history_table.setItem(row, 1, amount)
+            self.history_table.setItem(row, 2, QTableWidgetItem(result_text))
+            self.history_table.setItem(row, 3, QTableWidgetItem(signature_text))
+            self.history_table.setItem(row, 4, QTableWidgetItem(timestamp))
+
+            actions_widget = QWidget()
+            actions_layout = QHBoxLayout()
+            actions_layout.setContentsMargins(0, 0, 0, 0)
+            copy_button = QPushButton("Copy")
+            copy_button.clicked.connect(
+                lambda _, sig=entry.signature: self._copy_signature(sig)
+            )
+            explorer_button = QPushButton("Explorer")
+            explorer_button.clicked.connect(
+                lambda _, sig=entry.signature: self._open_explorer(sig)
+            )
+            actions_layout.addWidget(copy_button)
+            actions_layout.addWidget(explorer_button)
+            actions_layout.addStretch()
+            actions_widget.setLayout(actions_layout)
+            self.history_table.setCellWidget(row, 5, actions_widget)
+
+    def _copy_signature(self, signature: str) -> None:
+        QApplication.clipboard().setText(signature)
+
+    def _open_explorer(self, signature: str) -> None:
+        QDesktopServices.openUrl(QUrl(self._signature_url(signature)))
 
     def _create_ata_for_mint(self) -> None:
         mint = self.mint_input.text().strip()
@@ -663,6 +818,7 @@ class TreasuryConsole(QWidget):
 
     def _handle_network_changed(self, network: str) -> None:
         self.wallet_state.switch_network(network)
+        self.wallet_state.set_active_mint(None)
         self.wallet_state.sol_balance = None
         self.network_chip.setText(self._network_chip_text())
         self.wallet_status.setText(self.wallet_state.status_line())
