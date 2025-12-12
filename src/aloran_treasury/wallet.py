@@ -12,6 +12,7 @@ from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 
 Network = Literal["Mainnet", "Testnet", "Devnet"]
+TokenProgram = Literal["Token-2022", "Token"]
 NETWORKS: list[Network] = ["Mainnet", "Testnet", "Devnet"]
 
 DEFAULT_ENDPOINTS: dict[Network, str] = {
@@ -19,6 +20,13 @@ DEFAULT_ENDPOINTS: dict[Network, str] = {
     "Testnet": "https://api.testnet.solana.com",
     "Devnet": "https://api.devnet.solana.com",
 }
+
+TOKEN_PROGRAM_IDS: dict[TokenProgram, str] = {
+    "Token-2022": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+    "Token": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+}
+
+DEFAULT_RENT_EXEMPT_LAMPORTS = 2_039_280
 
 LAMPORTS_PER_SOL = 1_000_000_000
 
@@ -45,14 +53,29 @@ class TransferResult:
 
 
 @dataclass
+class AssociatedTokenAccount:
+    """Simple in-memory representation of an ATA for preview flows."""
+
+    address: str
+    mint: str
+    token_program: TokenProgram
+    balance: float = 0.0
+    rent_lamports: int = DEFAULT_RENT_EXEMPT_LAMPORTS
+
+
+@dataclass
 class WalletState:
     """Represents the minimal visible state for the treasury wallet."""
 
     network: Network = "Devnet"
+    token_program: TokenProgram = "Token-2022"
     public_key: Optional[str] = None
     sol_balance: Optional[float] = None
     locked: bool = True
     pending_actions: list[str] = field(default_factory=list)
+    associated_accounts: dict[Network, list["AssociatedTokenAccount"]] = field(
+        default_factory=lambda: {network: [] for network in NETWORKS}
+    )
 
     def status_line(self) -> str:
         if self.locked:
@@ -75,6 +98,30 @@ class WalletState:
 
         self.network = network
 
+    def set_token_program(self, token_program: TokenProgram) -> None:
+        """Persist the user's chosen token program for ATA previews."""
+
+        self.token_program = token_program
+
+    def associated_accounts_for_network(self, network: Optional[Network] = None) -> list[
+        AssociatedTokenAccount
+    ]:
+        """Return the cached ATAs for the given or active network."""
+
+        return self.associated_accounts[network or self.network]
+
+    def replace_associated_accounts(
+        self, accounts: list[AssociatedTokenAccount], network: Optional[Network] = None
+    ) -> None:
+        """Update the ATA cache for the active or specified network."""
+
+        self.associated_accounts[network or self.network] = accounts
+
+    def add_associated_account(self, account: AssociatedTokenAccount) -> None:
+        """Store a new ATA preview for the active network."""
+
+        self.associated_accounts[self.network].append(account)
+
     def enqueue_action(self, description: str) -> None:
         """Record a future action in the activity list."""
 
@@ -87,6 +134,16 @@ class WalletController:
     def __init__(self, state: WalletState) -> None:
         self.state = state
         self._keypair: Optional[Keypair] = None
+
+    def set_token_program(self, token_program: TokenProgram) -> None:
+        """Update the active token program preference."""
+
+        self.state.set_token_program(token_program)
+
+    def current_token_program_id(self) -> str:
+        """Return the on-chain program id for the selected SPL token program."""
+
+        return TOKEN_PROGRAM_IDS[self.state.token_program]
 
     def generate_ephemeral(self) -> str:
         """Create a new in-memory keypair for previews.
@@ -157,6 +214,52 @@ class WalletController:
 
         # Assume one signature and a small bump for multiple instructions.
         return lamports_per_sig * max(1, instructions)
+
+    def list_associated_accounts(self, mint: Optional[str] = None) -> list[
+        AssociatedTokenAccount
+    ]:
+        """Return cached ATAs for the active network, optionally filtered by mint."""
+
+        accounts = self.state.associated_accounts_for_network()
+        if mint:
+            return [ata for ata in accounts if ata.mint == mint]
+        return accounts
+
+    def ensure_associated_account(self, mint: str) -> AssociatedTokenAccount:
+        """Create or return the existing ATA for the given mint."""
+
+        if self._keypair is None:
+            raise RuntimeError("Load or generate a keypair to manage token accounts")
+
+        existing = self.list_associated_accounts(mint)
+        if existing:
+            return existing[0]
+
+        # Generate a placeholder PDA-like address for previews.
+        address = f"ata_{secrets.token_hex(16)}"
+        account = AssociatedTokenAccount(
+            address=address,
+            mint=mint,
+            token_program=self.state.token_program,
+        )
+        self.state.add_associated_account(account)
+        return account
+
+    def close_associated_account(
+        self, ata_address: str, force: bool = False
+    ) -> tuple[AssociatedTokenAccount, int]:
+        """Remove an ATA from the preview cache and return reclaimed rent."""
+
+        accounts = self.state.associated_accounts_for_network()
+        match = next((ata for ata in accounts if ata.address == ata_address), None)
+        if match is None:
+            raise ValueError("Associated account not found for this network")
+        if match.balance > 0 and not force:
+            raise ValueError("Account still holds tokens; close requires confirmation")
+
+        remaining = [ata for ata in accounts if ata.address != ata_address]
+        self.state.replace_associated_accounts(remaining)
+        return match, match.rent_lamports
 
     def transfer(
         self,

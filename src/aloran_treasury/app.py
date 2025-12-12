@@ -34,7 +34,15 @@ from PySide6.QtWidgets import (
 )
 
 from .theme import BACKGROUND, FONT_FAMILY, FONT_SIZE, PALETTE, SURFACE, SURFACE_ALT, TEXT_MUTED, TEXT_PRIMARY, muted
-from .wallet import NETWORKS, TransferRequest, WalletController, WalletState
+from .wallet import (
+    LAMPORTS_PER_SOL,
+    NETWORKS,
+    AssociatedTokenAccount,
+    TokenProgram,
+    TransferRequest,
+    WalletController,
+    WalletState,
+)
 
 
 def configure_palette(app: QApplication) -> None:
@@ -276,6 +284,7 @@ class TreasuryConsole(QWidget):
         self.setMinimumSize(720, 720)
         self.failed_transfers: list[tuple[TransferRequest, Optional[float]]] = []
         self._build()
+        self._refresh_ata_table()
 
     def _build(self) -> None:
         layout = QVBoxLayout()
@@ -329,6 +338,50 @@ class TreasuryConsole(QWidget):
         balance_label = QLabel(self._balance_line())
         balance_label.setObjectName("muted")
 
+        ata_header = QLabel("Associated Token Accounts")
+        ata_header.setStyleSheet("font-size: 12pt; font-weight: 700;")
+        ata_summary = QLabel(self._ata_summary_line())
+        ata_summary.setObjectName("muted")
+
+        program_row = QHBoxLayout()
+        program_label = QLabel("Token program")
+        program_label.setObjectName("muted")
+        program_select = QComboBox()
+        program_select.addItems(["Token-2022", "Token"])
+        program_select.setCurrentText(self.wallet_state.token_program)
+        program_select.currentTextChanged.connect(self._change_token_program)
+        program_row.addWidget(program_label)
+        program_row.addWidget(program_select)
+        program_row.addStretch()
+
+        mint_row = QHBoxLayout()
+        mint_label = QLabel("Mint address")
+        mint_label.setObjectName("muted")
+        mint_input = QLineEdit()
+        mint_input.setPlaceholderText("Enter mint to ensure ATA")
+        mint_button = QPushButton("Create/lookup ATA")
+        mint_button.clicked.connect(self._create_ata_for_mint)
+        mint_row.addWidget(mint_label)
+        mint_row.addWidget(mint_input)
+        mint_row.addWidget(mint_button)
+
+        ata_table = QTableWidget(0, 5)
+        ata_table.setHorizontalHeaderLabels(
+            ["Mint", "Address", "Program", "Balance", "Reclaim (SOL)"]
+        )
+        ata_table.horizontalHeader().setStretchLastSection(True)
+        ata_table.setAlternatingRowColors(True)
+
+        ata_actions = QHBoxLayout()
+        refresh_atas = QPushButton("Refresh ATA list")
+        refresh_atas.clicked.connect(self._refresh_ata_table)
+        close_ata = QPushButton("Close selected ATA")
+        close_ata.setObjectName("danger")
+        close_ata.clicked.connect(self._close_selected_ata)
+        ata_actions.addWidget(refresh_atas)
+        ata_actions.addWidget(close_ata)
+        ata_actions.addStretch()
+
         lock_button = QPushButton("Unlock" if self.wallet_state.locked else "Lock")
         lock_button.clicked.connect(self._toggle_lock)
         generate_button = QPushButton("Generate session key")
@@ -343,6 +396,10 @@ class TreasuryConsole(QWidget):
         self.wallet_status = wallet_status
         self.public_key_label = pubkey_label
         self.balance_label = balance_label
+        self.ata_table = ata_table
+        self.mint_input = mint_input
+        self.program_select = program_select
+        self.ata_summary_label = ata_summary
 
         layout.addWidget(title, 0, 0, 1, 2)
         layout.addWidget(subtitle, 1, 0, 1, 2)
@@ -354,6 +411,12 @@ class TreasuryConsole(QWidget):
         layout.addWidget(import_button, 5, 1, 1, 1)
         layout.addWidget(copy_button, 6, 0, 1, 1)
         layout.addWidget(refresh_balance_button, 6, 1, 1, 1)
+        layout.addWidget(ata_header, 7, 0, 1, 2)
+        layout.addWidget(ata_summary, 8, 0, 1, 2)
+        layout.addLayout(program_row, 9, 0, 1, 2)
+        layout.addLayout(mint_row, 10, 0, 1, 2)
+        layout.addWidget(ata_table, 11, 0, 1, 2)
+        layout.addLayout(ata_actions, 12, 0, 1, 2)
         layout.setColumnStretch(0, 3)
         layout.setColumnStretch(1, 1)
 
@@ -425,6 +488,11 @@ class TreasuryConsole(QWidget):
             return "SOL balance: not fetched"
         return f"SOL balance: {self.wallet_state.sol_balance:.6f}"
 
+    def _ata_summary_line(self) -> str:
+        count = len(self.wallet_state.associated_accounts_for_network())
+        program = self.wallet_state.token_program
+        return f"ATAs on {self.wallet_state.network}: {count} · Program: {program}"
+
     def _signature_url(self, signature: str) -> str:
         cluster = self.wallet_state.network.lower()
         cluster_param = "" if cluster == "mainnet" else f"?cluster={cluster}"
@@ -432,6 +500,106 @@ class TreasuryConsole(QWidget):
 
     def _append_activity_line(self, item: QListWidgetItem, message: str) -> None:
         item.setText(f"{item.text()}\n• {message}")
+
+    def _refresh_ata_table(self) -> None:
+        accounts = self.wallet_controller.list_associated_accounts()
+        self.ata_table.setRowCount(len(accounts))
+        for row, ata in enumerate(accounts):
+            self.ata_table.setItem(row, 0, QTableWidgetItem(ata.mint))
+            self.ata_table.setItem(row, 1, QTableWidgetItem(ata.address))
+            self.ata_table.setItem(row, 2, QTableWidgetItem(ata.token_program))
+            self.ata_table.setItem(row, 3, QTableWidgetItem(f"{ata.balance:.6f}"))
+            reclaim_sol = ata.rent_lamports / LAMPORTS_PER_SOL
+            self.ata_table.setItem(row, 4, QTableWidgetItem(f"{reclaim_sol:.6f}"))
+
+        self.ata_summary_label.setText(self._ata_summary_line())
+
+    def _create_ata_for_mint(self) -> None:
+        mint = self.mint_input.text().strip()
+        if not mint:
+            self._show_error("Mint required", "Enter a mint address to continue.")
+            return
+
+        try:
+            account = self.wallet_controller.ensure_associated_account(mint)
+        except Exception as exc:  # noqa: BLE001 - surface to user
+            self._show_error("ATA creation failed", str(exc))
+            return
+
+        self._refresh_ata_table()
+        self._enqueue_action(
+            f"Ensured ATA for mint {mint} on {self.wallet_state.network}"
+        )
+        self._show_message(
+            "ATA ready",
+            (
+                f"Address: {account.address}\n"
+                f"Program: {account.token_program}\n"
+                "Existing accounts remain cached per network for quick review."
+            ),
+        )
+
+    def _close_selected_ata(self) -> None:
+        row = self.ata_table.currentRow()
+        if row < 0:
+            self._show_error("Select an account", "Choose an ATA to close from the list.")
+            return
+
+        address = self.ata_table.item(row, 1).text()
+        account = next(
+            (ata for ata in self.wallet_controller.list_associated_accounts() if ata.address == address),
+            None,
+        )
+        if account is None:
+            self._show_error("Not found", "The selected ATA is no longer tracked.")
+            return
+
+        reclaim_sol = account.rent_lamports / LAMPORTS_PER_SOL
+        force = False
+        if account.balance > 0:
+            warning = QMessageBox.question(
+                self,
+                "Close non-empty ATA?",
+                (
+                    "This account still holds tokens. Closing it will attempt to reclaim rent "
+                    "and may lock remaining tokens. Proceed?"
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if warning != QMessageBox.StandardButton.Yes:
+                return
+            force = True
+        else:
+            preview = QMessageBox.question(
+                self,
+                "Close ATA",
+                f"Reclaim approximately {reclaim_sol:.6f} SOL in rent from this empty ATA?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if preview != QMessageBox.StandardButton.Yes:
+                return
+
+        try:
+            _, reclaimed = self.wallet_controller.close_associated_account(
+                address, force=force
+            )
+        except Exception as exc:  # noqa: BLE001 - surface to user
+            self._show_error("Close failed", str(exc))
+            return
+
+        self._refresh_ata_table()
+        self._enqueue_action(
+            f"Closed ATA {address} on {self.wallet_state.network}"
+        )
+        self._show_message(
+            "Account closed",
+            f"Reclaimed {reclaimed / LAMPORTS_PER_SOL:.6f} SOL in rent refunds.",
+        )
+
+    def _change_token_program(self, program: str) -> None:
+        self.wallet_controller.set_token_program(program)  # type: ignore[arg-type]
+        self.ata_summary_label.setText(self._ata_summary_line())
+        self._enqueue_action(f"Switched token program to {program}")
 
     def _open_transfer_dialog(self) -> None:
         dialog = TransferDialog(self)
@@ -500,6 +668,7 @@ class TreasuryConsole(QWidget):
         self.wallet_status.setText(self.wallet_state.status_line())
         self.balance_label.setText(self._balance_line())
         self._enqueue_action(f"Switched to {network}")
+        self._refresh_ata_table()
 
     def _toggle_lock(self) -> None:
         self.wallet_state.toggle_lock()
