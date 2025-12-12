@@ -28,6 +28,7 @@ class EndpointStatus:
     healthy: Optional[bool] = None
     latency_ms: Optional[float] = None
     last_checked: Optional[float] = None
+    supports_token2022: bool = False
 
     def mark_result(self, healthy: bool, latency_ms: Optional[float]) -> None:
         """Record the outcome of a health probe."""
@@ -46,6 +47,7 @@ def _default_endpoint_matrix() -> dict[Network, list[EndpointStatus]]:
                 url="https://api.mainnet-beta.solana.com",
                 label="Solana Foundation",  # default public endpoint
                 priority=0,
+                supports_token2022=True,
             ),
         ],
         "Testnet": [
@@ -53,6 +55,7 @@ def _default_endpoint_matrix() -> dict[Network, list[EndpointStatus]]:
                 url="https://api.testnet.solana.com",
                 label="Solana Foundation",  # default public endpoint
                 priority=0,
+                supports_token2022=False,
             ),
         ],
         "Devnet": [
@@ -60,6 +63,7 @@ def _default_endpoint_matrix() -> dict[Network, list[EndpointStatus]]:
                 url="https://api.devnet.solana.com",
                 label="Solana Foundation",  # default public endpoint
                 priority=0,
+                supports_token2022=True,
             ),
         ],
     }
@@ -556,6 +560,36 @@ class WalletController:
 
         return TOKEN_PROGRAM_IDS[self.state.token_program]
 
+    def token2022_supported(self, network: Optional[Network] = None) -> bool:
+        """Return whether the selected or provided network supports token-2022."""
+
+        endpoint = self.select_endpoint(network)
+        return bool(endpoint.supports_token2022)
+
+    def token_program_supported(
+        self, program: TokenProgram, network: Optional[Network] = None
+    ) -> bool:
+        """Return whether the given token program can be used on the network."""
+
+        if program == "Token-2022":
+            try:
+                return self.token2022_supported(network)
+            except Exception:
+                return False
+        return True
+
+    def require_token_program_support(self, program: TokenProgram) -> None:
+        """Raise if the requested token program is not supported on the network."""
+
+        if self.token_program_supported(program):
+            return
+        raise RuntimeError(
+            (
+                "Token-2022 extensions are unavailable on this endpoint. "
+                "Switch to Devnet/Mainnet or configure a compatible RPC."
+            )
+        )
+
     def generate_ephemeral(self) -> str:
         """Create a new in-memory keypair for previews.
 
@@ -727,6 +761,8 @@ class WalletController:
         if self._keypair is None:
             raise RuntimeError("Load or generate a keypair to manage token accounts")
 
+        self.require_token_program_support(self.state.token_program)
+
         existing = self.list_associated_accounts(mint)
         if existing:
             self.state.set_active_mint(mint)
@@ -782,6 +818,8 @@ class WalletController:
             raise RuntimeError("No keypair is loaded")
         if amount_sol <= 0:
             raise ValueError("Amount must be greater than zero")
+
+        self.require_token_program_support(self.state.token_program)
 
         request = TransferRequest(
             recipient_label=recipient,
