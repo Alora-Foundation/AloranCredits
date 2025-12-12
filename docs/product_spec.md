@@ -8,6 +8,7 @@
 ## Network Modes
 - **Cluster switching:** Built-in selector for **Mainnet**, **Testnet**, and **Devnet** to enable experimentation before using real funds.
 - **RPC configuration:** Allow setting primary and fallback RPC URLs per cluster with 2025-era Solana features enabled (compute budget tuning, priority fees, and transaction versioning).
+- **Health & failover (prototype):** The UI now pings multiple endpoints per cluster and selects the healthiest option automatically.
 
 ## Wallet & Key Management
 - **Built-in treasury wallet:** Native Solana wallet inside the app to hold SOL for fees and SPL tokens. Supports creating, importing (seed phrase), and exporting encrypted backups.
@@ -17,6 +18,7 @@
 ## SPL Token Control (2025-ready)
 - **Token lifecycle:** Create new SPL mints or manage existing ones. Full control over mint authority, freeze authority, and supply (mint/burn).
 - **Transfers & accounts:** Transfer tokens, manage associated token accounts, batch/airdrop via CSV, and close empty accounts to reclaim rent.
+- **Prototype progress:** Treasury ATA creation/closure helpers are wired to RPC calls to validate account workflows ahead of mint/transfer wiring.
 - **Token-2022 extensions:** Support latest features such as transfer hooks, default account state, mint close authority, interest-bearing/metadata updates, and required memo/transfer fees where applicable.
 - **Simulation & safety:** Preflight simulations, fee estimation, rate-limit and spend-limit guards, and transaction review before signing.
 
