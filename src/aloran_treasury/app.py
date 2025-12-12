@@ -5,8 +5,10 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 import sys
+import time
 from typing import Iterable, List, Optional
 
+from PySide6.QtCore import QTimer
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (
     QApplication,
@@ -40,6 +42,7 @@ from .wallet import (
     AssociatedTokenAccount,
     TokenProgram,
     TransferRequest,
+    EndpointHealth,
     WalletController,
     WalletState,
 )
@@ -285,6 +288,13 @@ class TreasuryConsole(QWidget):
         self.failed_transfers: list[tuple[TransferRequest, Optional[float]]] = []
         self._build()
         self._refresh_ata_table()
+        self.wallet_controller.register_health_listener(self._handle_endpoint_health)
+        self.wallet_controller.register_rotation_listener(
+            self._handle_endpoint_rotation
+        )
+        self._handle_endpoint_health(
+            None, self.wallet_state.endpoint_health[self.wallet_state.network]
+        )
 
     def _build(self) -> None:
         layout = QVBoxLayout()
@@ -292,6 +302,7 @@ class TreasuryConsole(QWidget):
         header.setStyleSheet("font-size: 20pt; font-weight: 700;")
         layout.addWidget(header)
 
+        layout.addLayout(self._notification_banner())
         layout.addLayout(self._network_row())
         layout.addLayout(self._wallet_card())
         layout.addLayout(self._actions_grid())
@@ -315,10 +326,42 @@ class TreasuryConsole(QWidget):
         chip.setObjectName("networkChip")
         self.network_chip = chip
 
+        warning = QLabel()
+        warning.setVisible(False)
+        warning.setObjectName("networkWarning")
+        warning.setStyleSheet(
+            "padding: 6px 10px; border-radius: 10px; "
+            f"background-color: {PALETTE['medium_blue']}; font-weight: 600;"
+        )
+        self.endpoint_warning = warning
+
+        retry = QPushButton("Refresh endpoint")
+        retry.setVisible(False)
+        retry.clicked.connect(self._retry_endpoint)
+        self.endpoint_retry = retry
+
         row.addWidget(label)
         row.addWidget(combo)
         row.addStretch()
         row.addWidget(chip)
+        row.addWidget(warning)
+        row.addWidget(retry)
+        return row
+
+    def _notification_banner(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        toast = QLabel()
+        toast.setVisible(False)
+        toast.setStyleSheet(
+            f"padding: 10px 12px; border-radius: 8px; background: {PALETTE['light_green']};"
+            "font-weight: 700;"
+        )
+        toast.setObjectName("toastBanner")
+        row.addWidget(toast)
+        self.toast_label = toast
+        self.toast_timer = QTimer()
+        self.toast_timer.setSingleShot(True)
+        self.toast_timer.timeout.connect(lambda: self.toast_label.setVisible(False))
         return row
 
     def _wallet_card(self) -> QHBoxLayout:
@@ -476,6 +519,18 @@ class TreasuryConsole(QWidget):
     def _network_chip_text(self) -> str:
         return f"{self.wallet_state.network} · preview"
 
+    def _update_network_chip_style(self, status: str) -> None:
+        if status == "degraded":
+            background = PALETTE["medium_blue"]
+        elif status == "unhealthy":
+            background = PALETTE["light_green"]
+        else:
+            background = PALETTE["dark_blue"]
+        self.network_chip.setStyleSheet(
+            f"padding: 6px 10px; background-color: {background}; "
+            f"border-radius: 12px; font-weight: 600;"
+        )
+
     def _public_key_line(self) -> str:
         return (
             f"Public key: {self.wallet_state.public_key}"
@@ -500,6 +555,11 @@ class TreasuryConsole(QWidget):
 
     def _append_activity_line(self, item: QListWidgetItem, message: str) -> None:
         item.setText(f"{item.text()}\n• {message}")
+
+    def _add_activity_entry(self, message: str) -> None:
+        timestamp = time.strftime("%H:%M:%S")
+        self.activity_list.addItem(QListWidgetItem(f"[{timestamp}] {message}"))
+        self.activity_list.scrollToBottom()
 
     def _refresh_ata_table(self) -> None:
         accounts = self.wallet_controller.list_associated_accounts()
@@ -669,6 +729,9 @@ class TreasuryConsole(QWidget):
         self.balance_label.setText(self._balance_line())
         self._enqueue_action(f"Switched to {network}")
         self._refresh_ata_table()
+        self._handle_endpoint_health(
+            None, self.wallet_state.endpoint_health[self.wallet_state.network]
+        )
 
     def _toggle_lock(self) -> None:
         self.wallet_state.toggle_lock()
@@ -722,6 +785,9 @@ class TreasuryConsole(QWidget):
         try:
             balance = self.wallet_controller.refresh_balance()
         except Exception as exc:  # noqa: BLE001 - surface RPC errors
+            self.wallet_controller.update_endpoint_health(
+                "degraded", reason=str(exc)
+            )
             self._show_error("Balance error", str(exc))
             return
 
@@ -732,11 +798,84 @@ class TreasuryConsole(QWidget):
         self.wallet_status.setText(self.wallet_state.status_line())
         self.balance_label.setText(self._balance_line())
         self._enqueue_action("Balance refreshed")
+        self.wallet_controller.update_endpoint_health(
+            "healthy", reason="Balance refreshed"
+        )
 
     def _enqueue_action(self, description: str) -> None:
         self.wallet_state.enqueue_action(description)
         item = QListWidgetItem(description)
         self.activity_list.addItem(item)
+
+    def _handle_endpoint_health(
+        self, previous: Optional[EndpointHealth], current: EndpointHealth
+    ) -> None:
+        if current.network != self.wallet_state.network:
+            return
+
+        latency = (
+            f" · {current.latency_ms:.0f} ms" if current.latency_ms is not None else ""
+        )
+        reason = f" · {current.reason}" if current.reason else ""
+
+        if previous is not None and previous.status != current.status:
+            if current.status == "healthy":
+                self._add_activity_entry(
+                    f"{current.network} endpoint recovered: {current.endpoint}{latency}{reason}"
+                )
+            elif current.status == "unhealthy":
+                self._add_activity_entry(
+                    f"{current.network} endpoint UNHEALTHY: {current.endpoint}{latency}{reason}"
+                )
+            elif current.status == "degraded":
+                self._add_activity_entry(
+                    f"{current.network} endpoint degraded: {current.endpoint}{latency}{reason}"
+                )
+
+        self._update_network_chip_style(current.status)
+        self._update_endpoint_warning(current)
+
+    def _handle_endpoint_rotation(
+        self, previous: EndpointHealth, current: EndpointHealth, reason: str
+    ) -> None:
+        if current.network != self.wallet_state.network:
+            return
+
+        message = (
+            f"Endpoint rotated ({reason}):\n{previous.endpoint} → {current.endpoint}"
+        )
+        self._show_toast(message)
+        self._add_activity_entry(
+            f"Auto-rotated endpoint for {current.network}: {previous.endpoint} → {current.endpoint} ({reason})"
+        )
+        self.network_chip.setText(self._network_chip_text())
+
+    def _update_endpoint_warning(self, health: EndpointHealth) -> None:
+        if health.status == "degraded":
+            latency = (
+                f" ({health.latency_ms:.0f} ms)" if health.latency_ms is not None else ""
+            )
+            reason = f" · {health.reason}" if health.reason else ""
+            self.endpoint_warning.setText(
+                f"Endpoint degraded{latency}{reason}. Monitoring in progress."
+            )
+            self.endpoint_warning.setVisible(True)
+            self.endpoint_retry.setVisible(True)
+        else:
+            self.endpoint_warning.setVisible(False)
+            self.endpoint_retry.setVisible(False)
+
+    def _retry_endpoint(self) -> None:
+        self.wallet_controller.rotate_endpoint(
+            "Manual refresh request", network=self.wallet_state.network
+        )
+
+    def _show_toast(self, message: str) -> None:
+        self.toast_label.setText(message)
+        self.toast_label.setVisible(True)
+        if self.toast_timer.isActive():
+            self.toast_timer.stop()
+        self.toast_timer.start(4500)
 
     def _show_error(self, title: str, message: str) -> None:
         QMessageBox.critical(self, title, message)

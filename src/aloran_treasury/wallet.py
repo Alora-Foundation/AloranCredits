@@ -21,6 +21,21 @@ DEFAULT_ENDPOINTS: dict[Network, str] = {
     "Devnet": "https://api.devnet.solana.com",
 }
 
+ENDPOINT_POOLS: dict[Network, list[str]] = {
+    "Mainnet": [
+        DEFAULT_ENDPOINTS["Mainnet"],
+        "https://rpc.ankr.com/solana",
+    ],
+    "Testnet": [
+        DEFAULT_ENDPOINTS["Testnet"],
+        "https://api.testnet.solana.com/fallback",
+    ],
+    "Devnet": [
+        DEFAULT_ENDPOINTS["Devnet"],
+        "https://api.devnet.solana.com/fallback",
+    ],
+}
+
 TOKEN_PROGRAM_IDS: dict[TokenProgram, str] = {
     "Token-2022": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
     "Token": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
@@ -64,6 +79,18 @@ class AssociatedTokenAccount:
 
 
 @dataclass
+class EndpointHealth:
+    """Track the current health and metadata for an RPC endpoint."""
+
+    network: Network
+    endpoint: str
+    status: Literal["healthy", "degraded", "unhealthy"]
+    latency_ms: Optional[float] = None
+    reason: Optional[str] = None
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
 class WalletState:
     """Represents the minimal visible state for the treasury wallet."""
 
@@ -75,6 +102,20 @@ class WalletState:
     pending_actions: list[str] = field(default_factory=list)
     associated_accounts: dict[Network, list["AssociatedTokenAccount"]] = field(
         default_factory=lambda: {network: [] for network in NETWORKS}
+    )
+    endpoint_indices: dict[Network, int] = field(
+        default_factory=lambda: {network: 0 for network in NETWORKS}
+    )
+    endpoint_health: dict[Network, EndpointHealth] = field(
+        default_factory=lambda: {
+            network: EndpointHealth(
+                network=network,
+                endpoint=DEFAULT_ENDPOINTS[network],
+                status="healthy",
+                reason="Initialized",
+            )
+            for network in NETWORKS
+        }
     )
 
     def status_line(self) -> str:
@@ -97,6 +138,11 @@ class WalletState:
         """Update the active cluster."""
 
         self.network = network
+
+    def current_endpoint_index(self, network: Optional[Network] = None) -> int:
+        """Return the selected endpoint pool index for the network."""
+
+        return self.endpoint_indices[network or self.network]
 
     def set_token_program(self, token_program: TokenProgram) -> None:
         """Persist the user's chosen token program for ATA previews."""
@@ -134,6 +180,8 @@ class WalletController:
     def __init__(self, state: WalletState) -> None:
         self.state = state
         self._keypair: Optional[Keypair] = None
+        self._health_listeners: list[Callable[[EndpointHealth, EndpointHealth], None]] = []
+        self._rotation_listeners: list[Callable[[EndpointHealth, EndpointHealth, str], None]] = []
 
     def set_token_program(self, token_program: TokenProgram) -> None:
         """Update the active token program preference."""
@@ -172,7 +220,23 @@ class WalletController:
     def endpoint(self) -> str:
         """Return the RPC endpoint for the active network."""
 
-        return DEFAULT_ENDPOINTS[self.state.network]
+        return ENDPOINT_POOLS[self.state.network][
+            self.state.current_endpoint_index()
+        ]
+
+    def register_health_listener(
+        self, callback: Callable[[EndpointHealth, EndpointHealth], None]
+    ) -> None:
+        """Receive notifications when endpoint health changes."""
+
+        self._health_listeners.append(callback)
+
+    def register_rotation_listener(
+        self, callback: Callable[[EndpointHealth, EndpointHealth, str], None]
+    ) -> None:
+        """Receive notifications when an endpoint is rotated."""
+
+        self._rotation_listeners.append(callback)
 
     def refresh_balance(self) -> Optional[float]:
         """Fetch the SOL balance for the active keypair using the configured RPC endpoint."""
@@ -214,6 +278,58 @@ class WalletController:
 
         # Assume one signature and a small bump for multiple instructions.
         return lamports_per_sig * max(1, instructions)
+
+    def update_endpoint_health(
+        self,
+        status: Literal["healthy", "degraded", "unhealthy"],
+        *,
+        latency_ms: Optional[float] = None,
+        reason: Optional[str] = None,
+        auto_rotate: bool = False,
+        network: Optional[Network] = None,
+    ) -> EndpointHealth:
+        """Publish a new health snapshot and optionally trigger rotation."""
+
+        net = network or self.state.network
+        old_health = self.state.endpoint_health[net]
+        next_health = EndpointHealth(
+            network=net,
+            endpoint=ENDPOINT_POOLS[net][self.state.current_endpoint_index(net)],
+            status=status,
+            latency_ms=latency_ms,
+            reason=reason,
+        )
+        self.state.endpoint_health[net] = next_health
+        self._emit_health_change(old_health, next_health)
+
+        if status == "unhealthy" and auto_rotate:
+            self.rotate_endpoint(reason or "Automatic failover", network=net)
+
+        return next_health
+
+    def rotate_endpoint(
+        self, reason: str, network: Optional[Network] = None
+    ) -> EndpointHealth:
+        """Move to the next RPC endpoint in the pool and emit rotation events."""
+
+        net = network or self.state.network
+        pool = ENDPOINT_POOLS[net]
+        old_index = self.state.current_endpoint_index(net)
+        new_index = (old_index + 1) % len(pool)
+        old_health = self.state.endpoint_health[net]
+
+        self.state.endpoint_indices[net] = new_index
+        rotated_health = EndpointHealth(
+            network=net,
+            endpoint=pool[new_index],
+            status="healthy",
+            reason=reason,
+        )
+        self.state.endpoint_health[net] = rotated_health
+        for listener in self._rotation_listeners:
+            listener(old_health, rotated_health, reason)
+        self._emit_health_change(old_health, rotated_health)
+        return rotated_health
 
     def list_associated_accounts(self, mint: Optional[str] = None) -> list[
         AssociatedTokenAccount
@@ -349,3 +465,9 @@ class WalletController:
         self.state.public_key = str(keypair.pubkey())
         self.state.locked = False
         self.state.sol_balance = None
+
+    def _emit_health_change(
+        self, previous: EndpointHealth, current: EndpointHealth
+    ) -> None:
+        for listener in self._health_listeners:
+            listener(previous, current)
