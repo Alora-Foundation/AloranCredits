@@ -2,28 +2,39 @@
 
 from __future__ import annotations
 
+import csv
+from pathlib import Path
 import sys
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
     QFrame,
     QGridLayout,
     QHBoxLayout,
-    QLabel,
     QInputDialog,
+    QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from .theme import BACKGROUND, FONT_FAMILY, FONT_SIZE, PALETTE, SURFACE, SURFACE_ALT, TEXT_MUTED, TEXT_PRIMARY, muted
-from .wallet import NETWORKS, WalletController, WalletState
+from .wallet import NETWORKS, TransferRequest, WalletController, WalletState
 
 
 def configure_palette(app: QApplication) -> None:
@@ -87,6 +98,175 @@ def create_action_buttons(actions: Iterable[str]) -> List[QPushButton]:
     return buttons
 
 
+class TransferDialog(QDialog):
+    """Collect single or batch transfer details with validation."""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Send SPL Tokens")
+        self.setMinimumSize(720, 520)
+        self.transfers: list[TransferRequest] = []
+        self.rate_limit: Optional[float] = None
+        self._build()
+
+    def _build(self) -> None:
+        layout = QVBoxLayout()
+
+        tabs = QTabWidget()
+        tabs.addTab(self._single_transfer_tab(), "Single transfer")
+        tabs.addTab(self._csv_tab(), "CSV import")
+        self.tabs = tabs
+
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(
+            ["Recipient", "Address", "Amount (SOL)", "Status"]
+        )
+        self.table.horizontalHeader().setStretchLastSection(True)
+
+        rate_limit_row = QHBoxLayout()
+        rate_label = QLabel("Optional rate limit (tx/sec)")
+        self.rate_limit_spin = QDoubleSpinBox()
+        self.rate_limit_spin.setMaximum(10.0)
+        self.rate_limit_spin.setSingleStep(0.25)
+        self.rate_limit_spin.setSpecialValueText("No limit")
+        rate_limit_row.addWidget(rate_label)
+        rate_limit_row.addWidget(self.rate_limit_spin)
+        rate_limit_row.addStretch()
+
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        button_box.accepted.connect(self._accept)
+        button_box.rejected.connect(self.reject)
+
+        layout.addWidget(tabs)
+        layout.addWidget(QLabel("Staged transfers"))
+        layout.addWidget(self.table)
+        layout.addLayout(rate_limit_row)
+        layout.addWidget(button_box)
+        self.setLayout(layout)
+
+    def _single_transfer_tab(self) -> QWidget:
+        container = QWidget()
+        form = QFormLayout()
+
+        self.single_recipient_name = QLineEdit()
+        self.single_recipient_address = QLineEdit()
+        self.single_amount = QDoubleSpinBox()
+        self.single_amount.setMaximum(1_000_000_000)
+        self.single_amount.setDecimals(6)
+        self.single_amount.setValue(1.0)
+
+        add_button = QPushButton("Add to staged list")
+        add_button.clicked.connect(self._add_single_transfer)
+
+        form.addRow("Recipient label", self.single_recipient_name)
+        form.addRow("Address", self.single_recipient_address)
+        form.addRow("Amount (SOL)", self.single_amount)
+        form.addRow(add_button)
+
+        container.setLayout(form)
+        return container
+
+    def _csv_tab(self) -> QWidget:
+        container = QWidget()
+        column = QVBoxLayout()
+        helper = QLabel(
+            muted(
+                "Provide a CSV with columns recipient,address,amount. Invalid rows "
+                "stay listed with their error message."
+            )
+        )
+        load_button = QPushButton("Load CSV")
+        load_button.clicked.connect(self._load_csv)
+        self.csv_path_label = QLabel("No file loaded")
+        self.csv_path_label.setObjectName("muted")
+
+        column.addWidget(helper)
+        column.addWidget(load_button)
+        column.addWidget(self.csv_path_label)
+        column.addStretch()
+        container.setLayout(column)
+        return container
+
+    def _add_single_transfer(self) -> None:
+        label = self.single_recipient_name.text().strip() or "Recipient"
+        address = self.single_recipient_address.text().strip()
+        amount = float(self.single_amount.value())
+        status = self._validate(address, amount)
+        self._append_row(
+            TransferRequest(label, address, amount),
+            "Ready" if status is None else f"Invalid: {status}",
+        )
+
+    def _load_csv(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Import transfer CSV", "", "CSV Files (*.csv)")
+        if not path:
+            return
+
+        try:
+            with Path(path).open(newline="") as handle:
+                reader = csv.DictReader(handle)
+                expected = {"recipient", "address", "amount"}
+                if set(reader.fieldnames or []) != expected:
+                    raise ValueError(
+                        "CSV must include recipient,address,amount headers"
+                    )
+                for row in reader:
+                    label = (row.get("recipient") or "").strip() or "Recipient"
+                    address = (row.get("address") or "").strip()
+                    try:
+                        amount = float(row.get("amount", "0") or 0)
+                    except ValueError:
+                        amount = 0.0
+                    error = self._validate(address, amount)
+                    status = "Ready" if error is None else f"Invalid: {error}"
+                    self._append_row(TransferRequest(label, address, amount), status)
+            self.csv_path_label.setText(Path(path).name)
+        except Exception as exc:  # noqa: BLE001 - surface parsing errors
+            QMessageBox.critical(self, "CSV import failed", str(exc))
+
+    def _append_row(self, request: TransferRequest, status: str) -> None:
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QTableWidgetItem(request.recipient_label))
+        self.table.setItem(row, 1, QTableWidgetItem(request.recipient_address))
+        self.table.setItem(row, 2, QTableWidgetItem(f"{request.amount_sol:.6f}"))
+        self.table.setItem(row, 3, QTableWidgetItem(status))
+
+    def _validate(self, address: str, amount: float) -> Optional[str]:
+        if not address:
+            return "Address is required"
+        if len(address) < 20:
+            return "Address appears too short"
+        if amount <= 0:
+            return "Amount must be greater than zero"
+        return None
+
+    def _accept(self) -> None:
+        self.transfers = []
+        for row in range(self.table.rowCount()):
+            status = self.table.item(row, 3).text()
+            if status.lower().startswith("invalid"):
+                continue
+            label = self.table.item(row, 0).text()
+            address = self.table.item(row, 1).text()
+            amount_text = self.table.item(row, 2).text()
+            try:
+                amount = float(amount_text)
+            except ValueError:
+                continue
+            self.transfers.append(TransferRequest(label, address, amount))
+
+        if not self.transfers:
+            QMessageBox.warning(self, "Nothing to send", "Add at least one valid transfer.")
+            return
+
+        rate = float(self.rate_limit_spin.value())
+        self.rate_limit = rate if rate > 0 else None
+        self.accept()
+
+
 class TreasuryConsole(QWidget):
     def __init__(self) -> None:
         super().__init__()
@@ -94,6 +274,7 @@ class TreasuryConsole(QWidget):
         self.wallet_controller = WalletController(self.wallet_state)
         self.setWindowTitle("Aloran Treasury Console (Prototype)")
         self.setMinimumSize(720, 720)
+        self.failed_transfers: list[tuple[TransferRequest, Optional[float]]] = []
         self._build()
 
     def _build(self) -> None:
@@ -196,7 +377,12 @@ class TreasuryConsole(QWidget):
         )
 
         for idx, button in enumerate(buttons):
-            button.clicked.connect(lambda _, b=button: self._enqueue_action(b.text()))
+            if button.text() == "Transfer":
+                button.clicked.connect(self._open_transfer_dialog)
+            else:
+                button.clicked.connect(
+                    lambda _, b=button: self._enqueue_action(b.text())
+                )
             row = idx // 3
             col = idx % 3
             grid.addWidget(button, row, col)
@@ -213,9 +399,15 @@ class TreasuryConsole(QWidget):
         activity_list.addItem("Prototype ready. Configure wallet to begin.")
         self.activity_list = activity_list
 
+        retry_button = QPushButton("Retry failed transfers")
+        retry_button.setEnabled(False)
+        retry_button.clicked.connect(self._retry_failed_transfers)
+        self.retry_button = retry_button
+
         column.addWidget(label)
         column.addWidget(helper)
         column.addWidget(activity_list)
+        column.addWidget(retry_button)
         return column
 
     def _network_chip_text(self) -> str:
@@ -232,6 +424,74 @@ class TreasuryConsole(QWidget):
         if self.wallet_state.sol_balance is None:
             return "SOL balance: not fetched"
         return f"SOL balance: {self.wallet_state.sol_balance:.6f}"
+
+    def _signature_url(self, signature: str) -> str:
+        cluster = self.wallet_state.network.lower()
+        cluster_param = "" if cluster == "mainnet" else f"?cluster={cluster}"
+        return f"https://explorer.solana.com/tx/{signature}{cluster_param}"
+
+    def _append_activity_line(self, item: QListWidgetItem, message: str) -> None:
+        item.setText(f"{item.text()}\n• {message}")
+
+    def _open_transfer_dialog(self) -> None:
+        dialog = TransferDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        self._process_transfers(dialog.transfers, dialog.rate_limit)
+
+    def _process_transfers(
+        self, transfers: list[TransferRequest], rate_limit: Optional[float]
+    ) -> None:
+        if self.wallet_state.locked or not self.wallet_state.public_key:
+            self._show_error(
+                "Wallet locked", "Import or generate a keypair before transferring."
+            )
+            return
+
+        for transfer in transfers:
+            base = f"Transferring {transfer.amount_sol:.4f} SOL to {transfer.recipient_label}"
+            item = QListWidgetItem(base)
+            self.activity_list.addItem(item)
+
+            try:
+                result = self.wallet_controller.transfer(
+                    transfer.recipient_address,
+                    transfer.amount_sol,
+                    rate_limit_per_sec=rate_limit,
+                    on_progress=lambda msg, it=item: self._append_activity_line(
+                        it, msg
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 - surface failure
+                self._append_activity_line(item, f"✕ Failed: {exc}")
+                self.failed_transfers.append((transfer, rate_limit))
+                self.retry_button.setEnabled(True)
+                continue
+
+            signature_line = (
+                f"Explorer: {self._signature_url(result.signature)}"
+                if result.signature
+                else "Signature unavailable"
+            )
+            self._append_activity_line(
+                item,
+                (
+                    f"✓ Success · fee {result.fee_lamports} lamports\n"
+                    f"Blockhash: {result.blockhash}\n{signature_line}"
+                ),
+            )
+
+    def _retry_failed_transfers(self) -> None:
+        if not self.failed_transfers:
+            self.retry_button.setEnabled(False)
+            return
+
+        pending = self.failed_transfers.copy()
+        self.failed_transfers = []
+        self.retry_button.setEnabled(False)
+        for transfer, rate in pending:
+            self._process_transfers([transfer], rate)
 
     def _handle_network_changed(self, network: str) -> None:
         self.wallet_state.switch_network(network)
