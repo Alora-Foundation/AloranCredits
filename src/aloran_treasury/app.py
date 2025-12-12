@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 from .theme import BACKGROUND, FONT_FAMILY, FONT_SIZE, PALETTE, SURFACE, SURFACE_ALT, TEXT_MUTED, TEXT_PRIMARY, muted
+from .network_monitor import NetworkMonitor
 from .wallet import (
     LAMPORTS_PER_SOL,
     NETWORKS,
@@ -282,6 +283,7 @@ class TreasuryConsole(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.wallet_state = WalletState()
+        self.wallet_state.subscribe_endpoint_updates(self._update_network_chip)
         self.wallet_controller = WalletController(self.wallet_state)
         self.setWindowTitle("Aloran Treasury Console (Prototype)")
         self.setMinimumSize(720, 720)
@@ -290,6 +292,9 @@ class TreasuryConsole(QWidget):
         self.history_cursor: Optional[str] = None
         self._build()
         self._refresh_ata_table()
+        self.network_monitor = NetworkMonitor(self.wallet_state, interval_seconds=20, parent=self)
+        self.network_monitor.start()
+        self._update_network_chip()
 
     def _build(self) -> None:
         layout = QVBoxLayout()
@@ -314,10 +319,6 @@ class TreasuryConsole(QWidget):
         combo.currentTextChanged.connect(self._handle_network_changed)
 
         chip = QLabel(self._network_chip_text())
-        chip.setStyleSheet(
-            f"padding: 6px 10px; background-color: {PALETTE['dark_blue']}; "
-            f"border-radius: 12px; font-weight: 600;"
-        )
         chip.setObjectName("networkChip")
         self.network_chip = chip
 
@@ -542,7 +543,36 @@ class TreasuryConsole(QWidget):
         return column
 
     def _network_chip_text(self) -> str:
-        return f"{self.wallet_state.network} · preview"
+        status = self.wallet_state.current_endpoint_status()
+        latency = (
+            f"{status.last_latency_ms:.0f} ms" if status.last_latency_ms is not None else "—"
+        )
+        if status.last_checked is None:
+            state = "Checking…"
+        elif status.healthy:
+            state = "Healthy"
+        else:
+            state = "Unhealthy"
+        return f"{self.wallet_state.network} · {status.label} ({latency}) · {state}"
+
+    def _network_chip_style(self) -> str:
+        status = self.wallet_state.current_endpoint_status()
+        if status.last_checked is None:
+            background = PALETTE["medium_blue"]
+        elif status.healthy:
+            background = PALETTE["teal"]
+        else:
+            background = PALETTE["dark_purple"]
+        return (
+            f"padding: 6px 10px; background-color: {background}; "
+            f"border-radius: 12px; font-weight: 600;"
+        )
+
+    def _update_network_chip(self) -> None:
+        if not hasattr(self, "network_chip"):
+            return
+        self.network_chip.setText(self._network_chip_text())
+        self.network_chip.setStyleSheet(self._network_chip_style())
 
     def _public_key_line(self) -> str:
         return (
@@ -816,14 +846,21 @@ class TreasuryConsole(QWidget):
         for transfer, rate in pending:
             self._process_transfers([transfer], rate)
 
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt override
+        if hasattr(self, "network_monitor"):
+            self.network_monitor.stop()
+        super().closeEvent(event)
+
     def _handle_network_changed(self, network: str) -> None:
         self.wallet_state.switch_network(network)
         self.wallet_state.set_active_mint(None)
         self.wallet_state.sol_balance = None
-        self.network_chip.setText(self._network_chip_text())
+        self._update_network_chip()
         self.wallet_status.setText(self.wallet_state.status_line())
         self.balance_label.setText(self._balance_line())
         self._enqueue_action(f"Switched to {network}")
+        if hasattr(self, "network_monitor"):
+            self.network_monitor.force_poll()
         self._refresh_ata_table()
 
     def _toggle_lock(self) -> None:

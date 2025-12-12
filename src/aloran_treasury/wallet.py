@@ -138,6 +138,17 @@ class TransactionHistoryEntry:
 
 
 @dataclass
+class EndpointStatus:
+    """Track the health of a single RPC endpoint."""
+
+    label: str
+    url: str
+    healthy: Optional[bool] = None
+    last_latency_ms: Optional[float] = None
+    last_checked: Optional[float] = None
+
+
+@dataclass
 class TransferRequest:
     """Single transfer entry used by the UI and controller."""
 
@@ -183,6 +194,16 @@ class WalletState:
     associated_accounts: dict[Network, list["AssociatedTokenAccount"]] = field(
         default_factory=lambda: {network: [] for network in NETWORKS}
     )
+    endpoint_statuses: dict[Network, list[EndpointStatus]] = field(
+        default_factory=lambda: {
+            network: [EndpointStatus(label, url) for label, url in NETWORK_ENDPOINTS[network]]
+            for network in NETWORKS
+        }
+    )
+    active_endpoint_index: dict[Network, int] = field(
+        default_factory=lambda: {network: 0 for network in NETWORKS}
+    )
+    _endpoint_listeners: list[Callable[[], None]] = field(default_factory=list, repr=False)
 
     def status_line(self) -> str:
         if self.locked:
@@ -204,6 +225,7 @@ class WalletState:
         """Update the active cluster."""
 
         self.network = network
+        self._notify_endpoint_update()
 
     def set_token_program(self, token_program: TokenProgram) -> None:
         """Persist the user's chosen token program for ATA previews."""
@@ -238,6 +260,74 @@ class WalletState:
         """Record a future action in the activity list."""
 
         self.pending_actions.append(description)
+
+    def subscribe_endpoint_updates(self, listener: Callable[[], None]) -> None:
+        """Register a callback invoked when endpoint state changes."""
+
+        self._endpoint_listeners.append(listener)
+
+    def _notify_endpoint_update(self) -> None:
+        for listener in self._endpoint_listeners:
+            listener()
+
+    def endpoint_statuses_for_network(self, network: Optional[Network] = None) -> list[EndpointStatus]:
+        """Return all known endpoints for the given or active network."""
+
+        return self.endpoint_statuses[network or self.network]
+
+    def current_endpoint_status(self, network: Optional[Network] = None) -> EndpointStatus:
+        """Return the active endpoint status record for the network."""
+
+        active_network = network or self.network
+        index = self.active_endpoint_index[active_network]
+        return self.endpoint_statuses_for_network(active_network)[index]
+
+    @property
+    def current_endpoint_url(self) -> str:
+        """Convenience accessor for the current RPC URL."""
+
+        return self.current_endpoint_status().url
+
+    def record_endpoint_check(
+        self,
+        url: str,
+        healthy: bool,
+        latency_ms: Optional[float],
+        timestamp: float,
+        network: Optional[Network] = None,
+    ) -> None:
+        """Update health metadata for the endpoint matching the given URL."""
+
+        target_network = network or self.network
+        for status in self.endpoint_statuses_for_network(target_network):
+            if status.url == url:
+                status.healthy = healthy
+                status.last_latency_ms = latency_ms
+                status.last_checked = timestamp
+                break
+        self._notify_endpoint_update()
+
+    def advance_to_next_endpoint(self, network: Optional[Network] = None) -> EndpointStatus:
+        """Rotate to the next healthy (or least unhealthy) endpoint for the network."""
+
+        target_network = network or self.network
+        endpoints = self.endpoint_statuses_for_network(target_network)
+        if not endpoints:
+            raise RuntimeError("No endpoints configured")
+
+        current_index = self.active_endpoint_index[target_network]
+        for offset in range(1, len(endpoints) + 1):
+            candidate_index = (current_index + offset) % len(endpoints)
+            candidate = endpoints[candidate_index]
+            if candidate.healthy is not False:
+                self.active_endpoint_index[target_network] = candidate_index
+                self._notify_endpoint_update()
+                return candidate
+
+        # If all endpoints are marked unhealthy, still rotate to the next one.
+        self.active_endpoint_index[target_network] = (current_index + 1) % len(endpoints)
+        self._notify_endpoint_update()
+        return endpoints[self.active_endpoint_index[target_network]]
 
 
 def create_mint_instructions(
@@ -519,7 +609,7 @@ class WalletController:
         endpoint = self.select_endpoint()
         client = Client(endpoint.url)
         try:
-            fees = client.get_fees()
+            fees = self._with_endpoint_failover(lambda client: client.get_fees())
             # Prefer the RPC value if available; fall back to a nominal fee.
             lamports_per_sig = fees.value.fee_calculator.lamports_per_signature
             self._mark_endpoint_healthy(endpoint)
