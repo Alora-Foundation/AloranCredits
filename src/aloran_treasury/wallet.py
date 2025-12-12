@@ -66,6 +66,12 @@ def _default_endpoint_matrix() -> dict[Network, list[EndpointStatus]]:
         ],
     }
 
+
+NETWORK_ENDPOINTS: dict[Network, list[tuple[str, str]]] = {
+    network: [(status.label, status.url) for status in endpoints]
+    for network, endpoints in _default_endpoint_matrix().items()
+}
+
 TOKEN_PROGRAM_IDS: dict[TokenProgram, str] = {
     "Token-2022": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
     "Token": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
@@ -155,17 +161,6 @@ class TransactionHistoryEntry:
 
 
 @dataclass
-class EndpointStatus:
-    """Track the health of a single RPC endpoint."""
-
-    label: str
-    url: str
-    healthy: Optional[bool] = None
-    last_latency_ms: Optional[float] = None
-    last_checked: Optional[float] = None
-
-
-@dataclass
 class TransferRequest:
     """Single transfer entry used by the UI and controller."""
 
@@ -207,6 +202,8 @@ class WalletState:
     sol_balance: Optional[float] = None
     active_mint: Optional[str] = None
     locked: bool = True
+    decrypting: bool = False
+    unlock_error: Optional[str] = None
     pending_actions: list[str] = field(default_factory=list)
     associated_accounts: dict[Network, list["AssociatedTokenAccount"]] = field(
         default_factory=lambda: {network: [] for network in NETWORKS}
@@ -528,6 +525,13 @@ class WalletController:
         self.state = state
         self._keypair: Optional[Keypair] = None
         self.endpoints: dict[Network, list[EndpointStatus]] = _default_endpoint_matrix()
+        self._demo_passphrase = "treasury"
+
+    @property
+    def demo_passphrase(self) -> str:
+        """Return the placeholder passphrase used for the prototype."""
+
+        return self._demo_passphrase
 
     def set_token_program(self, token_program: TokenProgram) -> None:
         """Update the active token program preference."""
@@ -599,6 +603,31 @@ class WalletController:
         keypair = Keypair.from_base58_string(secret_b58.strip())
         self._apply_keypair(keypair)
         return str(keypair.pubkey())
+
+    def lock_wallet(self) -> None:
+        """Lock the in-memory keypair without discarding it."""
+
+        self.state.locked = True
+        self.state.decrypting = False
+        self.state.unlock_error = None
+
+    def unlock_wallet(self, passphrase: str) -> None:
+        """Unlock the keypair using the demo passphrase."""
+
+        if self._keypair is None:
+            raise RuntimeError("Load or generate a keypair before unlocking")
+
+        if not passphrase.strip():
+            self.state.unlock_error = "Passphrase required"
+            raise ValueError("Passphrase required")
+
+        if passphrase.strip() != self._demo_passphrase:
+            self.state.unlock_error = "Incorrect passphrase"
+            raise ValueError("Incorrect passphrase")
+
+        self.state.locked = False
+        self.state.decrypting = False
+        self.state.unlock_error = None
 
     def export_secret(self) -> str:
         """Return the base58 secret for the active keypair."""
@@ -1083,6 +1112,8 @@ class WalletController:
         self.state.public_key = str(keypair.pubkey())
         self.state.locked = False
         self.state.sol_balance = None
+        self.state.decrypting = False
+        self.state.unlock_error = None
 
     def select_endpoint(self, network: Optional[Network] = None) -> EndpointStatus:
         """Pick the best endpoint based on health and priority."""
