@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 from typing import Iterable, List, Optional
 
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import QUrl, Qt
 from PySide6.QtGui import QColor, QDesktopServices, QPalette
 from PySide6.QtWidgets import (
     QApplication,
@@ -360,6 +360,18 @@ class TreasuryConsole(QWidget):
         program_row.addWidget(program_select)
         program_row.addStretch()
 
+        compatibility_banner = QLabel(self._token_program_status_line())
+        compatibility_banner.setWordWrap(True)
+        compatibility_banner.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        compatibility_banner.setStyleSheet(
+            (
+                f"padding: 8px; border-radius: 8px;"
+                f"border: 1px solid {PALETTE['medium_blue']};"
+                f"background-color: {SURFACE_ALT};"
+            )
+        )
+        compatibility_banner.setObjectName("muted")
+
         mint_row = QHBoxLayout()
         mint_label = QLabel("Mint address")
         mint_label.setObjectName("muted")
@@ -406,6 +418,9 @@ class TreasuryConsole(QWidget):
         self.mint_input = mint_input
         self.program_select = program_select
         self.ata_summary_label = ata_summary
+        self.token_support_banner = compatibility_banner
+
+        self._update_token_support_banner()
 
         layout.addWidget(title, 0, 0, 1, 2)
         layout.addWidget(subtitle, 1, 0, 1, 2)
@@ -419,10 +434,11 @@ class TreasuryConsole(QWidget):
         layout.addWidget(refresh_balance_button, 6, 1, 1, 1)
         layout.addWidget(ata_header, 7, 0, 1, 2)
         layout.addWidget(ata_summary, 8, 0, 1, 2)
-        layout.addLayout(program_row, 9, 0, 1, 2)
-        layout.addLayout(mint_row, 10, 0, 1, 2)
-        layout.addWidget(ata_table, 11, 0, 1, 2)
-        layout.addLayout(ata_actions, 12, 0, 1, 2)
+        layout.addWidget(compatibility_banner, 9, 0, 1, 2)
+        layout.addLayout(program_row, 10, 0, 1, 2)
+        layout.addLayout(mint_row, 11, 0, 1, 2)
+        layout.addWidget(ata_table, 12, 0, 1, 2)
+        layout.addLayout(ata_actions, 13, 0, 1, 2)
         layout.setColumnStretch(0, 3)
         layout.setColumnStretch(1, 1)
 
@@ -570,6 +586,59 @@ class TreasuryConsole(QWidget):
         cluster_param = "" if cluster == "mainnet" else f"?cluster={cluster}"
         return f"https://explorer.solana.com/tx/{signature}{cluster_param}"
 
+    def _token_program_status_line(self) -> str:
+        supported = self.wallet_controller.token_program_supported("Token-2022")
+        endpoint = self.wallet_controller.select_endpoint().label
+        network = self.wallet_state.network
+        if supported:
+            return f"Token-2022 extensions supported on {network} ({endpoint})."
+        return (
+            "Token-2022 extensions are unavailable on this cluster. Switch to a "
+            "compatible endpoint to manage extension-enabled mints."
+        )
+
+    def _token_program_blocked_message(self) -> str:
+        return (
+            "This RPC endpoint does not advertise Token-2022 support. Switch to "
+            "Devnet/Mainnet or configure a compatible custom endpoint to use "
+            "extension-enabled tokens."
+        )
+
+    def _token_option_index(self, program: str) -> int:
+        for idx in range(self.program_select.count()):
+            if self.program_select.itemText(idx) == program:
+                return idx
+        return -1
+
+    def _update_token_support_banner(self) -> None:
+        supported = self.wallet_controller.token_program_supported("Token-2022")
+        border_color = PALETTE["teal"] if supported else PALETTE["medium_blue"]
+        background = SURFACE_ALT if supported else PALETTE["dark_blue"]
+        self.token_support_banner.setText(self._token_program_status_line())
+        self.token_support_banner.setStyleSheet(
+            (
+                f"padding: 8px; border-radius: 8px;"
+                f"border: 1px solid {border_color};"
+                f"background-color: {background};"
+            )
+        )
+
+        token2022_index = self._token_option_index("Token-2022")
+        if token2022_index >= 0:
+            model_item = self.program_select.model().item(token2022_index)
+            if model_item:
+                model_item.setEnabled(supported)
+        if not supported and self.program_select.currentText() == "Token-2022":
+            self.program_select.blockSignals(True)
+            self.program_select.setCurrentText("Token")
+            self.program_select.blockSignals(False)
+
+    def _guard_token_program_submission(self) -> bool:
+        if self.wallet_controller.token_program_supported(self.wallet_state.token_program):
+            return True
+        self._show_error("Token-2022 unsupported", self._token_program_blocked_message())
+        return False
+
     def _append_activity_line(self, item: QListWidgetItem, message: str) -> None:
         item.setText(f"{item.text()}\n• {message}")
 
@@ -675,6 +744,9 @@ class TreasuryConsole(QWidget):
             self._show_error("Mint required", "Enter a mint address to continue.")
             return
 
+        if not self._guard_token_program_submission():
+            return
+
         try:
             account = self.wallet_controller.ensure_associated_account(mint)
         except Exception as exc:  # noqa: BLE001 - surface to user
@@ -752,9 +824,21 @@ class TreasuryConsole(QWidget):
         )
 
     def _change_token_program(self, program: str) -> None:
+        if not self.wallet_controller.token_program_supported(program):
+            self._show_error(
+                "Token-2022 unavailable",
+                self._token_program_blocked_message(),
+            )
+            self.program_select.blockSignals(True)
+            self.program_select.setCurrentText("Token")
+            self.program_select.blockSignals(False)
+            self._update_token_support_banner()
+            return
+
         self.wallet_controller.set_token_program(program)  # type: ignore[arg-type]
         self.ata_summary_label.setText(self._ata_summary_line())
         self._enqueue_action(f"Switched token program to {program}")
+        self._update_token_support_banner()
 
     def _open_transfer_dialog(self) -> None:
         dialog = TransferDialog(self)
@@ -770,6 +854,9 @@ class TreasuryConsole(QWidget):
             self._show_error(
                 "Wallet locked", "Import or generate a keypair before transferring."
             )
+            return
+
+        if not self._guard_token_program_submission():
             return
 
         for transfer in transfers:
@@ -824,6 +911,7 @@ class TreasuryConsole(QWidget):
         self.wallet_status.setText(self.wallet_state.status_line())
         self.balance_label.setText(self._balance_line())
         self._enqueue_action(f"Switched to {network}")
+        self._update_token_support_banner()
         self._refresh_ata_table()
 
     def _toggle_lock(self) -> None:
