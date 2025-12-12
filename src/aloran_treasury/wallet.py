@@ -76,6 +76,71 @@ DEFAULT_RENT_EXEMPT_LAMPORTS = 2_039_280
 LAMPORTS_PER_SOL = 1_000_000_000
 
 
+def _program_id(token_program: TokenProgram) -> str:
+    """Return the canonical program id for the given token program."""
+
+    try:
+        return TOKEN_PROGRAM_IDS[token_program]
+    except KeyError as exc:  # pragma: no cover - defensive against unexpected values
+        raise ValueError(f"Unknown token program: {token_program}") from exc
+
+
+def _require_token_2022(token_program: TokenProgram) -> None:
+    """Raise an explicit error when an extension is requested on legacy SPL Token."""
+
+    if token_program != "Token-2022":
+        raise TokenProgramUnsupportedError(token_program)
+
+
+class TokenProgramUnsupportedError(RuntimeError):
+    """Raised when callers request token-2022-only behavior against the legacy program."""
+
+    def __init__(self, program: str) -> None:
+        super().__init__(f"Token program {program} does not support token-2022 extensions")
+        self.program = program
+
+
+@dataclass
+class InstructionStep:
+    """Lightweight placeholder for an instruction plan used by the UI preview flows."""
+
+    name: str
+    program_id: str
+    accounts: list[str] = field(default_factory=list)
+    data: dict[str, object] = field(default_factory=dict)
+    signers: list[str] = field(default_factory=list)
+
+
+@dataclass
+class TransferHookConfig:
+    """Configuration required to enable transfer hooks on a new mint."""
+
+    hook_program: str
+    validation_accounts: Optional[list[str]] = None
+
+
+@dataclass
+class InterestBearingConfig:
+    """Parameters for initializing an interest-bearing token-2022 mint."""
+
+    rate_basis_points: int
+    authority: str
+    initialization_data: Optional[dict[str, object]] = None
+
+
+@dataclass
+class MintInfo:
+    """Snapshot of mint settings derived from RPC responses."""
+
+    mint_address: str
+    token_program: TokenProgram
+    transfer_hook_program: Optional[str] = None
+    transfer_hook_accounts: Optional[list[str]] = None
+    close_authority: Optional[str] = None
+    interest_rate: Optional[float] = None
+    interest_authority: Optional[str] = None
+
+
 @dataclass
 class TransactionHistoryEntry:
     """Lightweight representation of a historical transaction."""
@@ -87,6 +152,17 @@ class TransactionHistoryEntry:
     kind: Literal["SOL", "Token"]
     success: bool
     error: Optional[str] = None
+
+
+@dataclass
+class EndpointStatus:
+    """Track the health of a single RPC endpoint."""
+
+    label: str
+    url: str
+    healthy: Optional[bool] = None
+    last_latency_ms: Optional[float] = None
+    last_checked: Optional[float] = None
 
 
 @dataclass
@@ -135,6 +211,16 @@ class WalletState:
     associated_accounts: dict[Network, list["AssociatedTokenAccount"]] = field(
         default_factory=lambda: {network: [] for network in NETWORKS}
     )
+    endpoint_statuses: dict[Network, list[EndpointStatus]] = field(
+        default_factory=lambda: {
+            network: [EndpointStatus(label, url) for label, url in NETWORK_ENDPOINTS[network]]
+            for network in NETWORKS
+        }
+    )
+    active_endpoint_index: dict[Network, int] = field(
+        default_factory=lambda: {network: 0 for network in NETWORKS}
+    )
+    _endpoint_listeners: list[Callable[[], None]] = field(default_factory=list, repr=False)
 
     def status_line(self) -> str:
         if self.locked:
@@ -156,6 +242,7 @@ class WalletState:
         """Update the active cluster."""
 
         self.network = network
+        self._notify_endpoint_update()
 
     def set_token_program(self, token_program: TokenProgram) -> None:
         """Persist the user's chosen token program for ATA previews."""
@@ -190,6 +277,248 @@ class WalletState:
         """Record a future action in the activity list."""
 
         self.pending_actions.append(description)
+
+    def subscribe_endpoint_updates(self, listener: Callable[[], None]) -> None:
+        """Register a callback invoked when endpoint state changes."""
+
+        self._endpoint_listeners.append(listener)
+
+    def _notify_endpoint_update(self) -> None:
+        for listener in self._endpoint_listeners:
+            listener()
+
+    def endpoint_statuses_for_network(self, network: Optional[Network] = None) -> list[EndpointStatus]:
+        """Return all known endpoints for the given or active network."""
+
+        return self.endpoint_statuses[network or self.network]
+
+    def current_endpoint_status(self, network: Optional[Network] = None) -> EndpointStatus:
+        """Return the active endpoint status record for the network."""
+
+        active_network = network or self.network
+        index = self.active_endpoint_index[active_network]
+        return self.endpoint_statuses_for_network(active_network)[index]
+
+    @property
+    def current_endpoint_url(self) -> str:
+        """Convenience accessor for the current RPC URL."""
+
+        return self.current_endpoint_status().url
+
+    def record_endpoint_check(
+        self,
+        url: str,
+        healthy: bool,
+        latency_ms: Optional[float],
+        timestamp: float,
+        network: Optional[Network] = None,
+    ) -> None:
+        """Update health metadata for the endpoint matching the given URL."""
+
+        target_network = network or self.network
+        for status in self.endpoint_statuses_for_network(target_network):
+            if status.url == url:
+                status.healthy = healthy
+                status.last_latency_ms = latency_ms
+                status.last_checked = timestamp
+                break
+        self._notify_endpoint_update()
+
+    def advance_to_next_endpoint(self, network: Optional[Network] = None) -> EndpointStatus:
+        """Rotate to the next healthy (or least unhealthy) endpoint for the network."""
+
+        target_network = network or self.network
+        endpoints = self.endpoint_statuses_for_network(target_network)
+        if not endpoints:
+            raise RuntimeError("No endpoints configured")
+
+        current_index = self.active_endpoint_index[target_network]
+        for offset in range(1, len(endpoints) + 1):
+            candidate_index = (current_index + offset) % len(endpoints)
+            candidate = endpoints[candidate_index]
+            if candidate.healthy is not False:
+                self.active_endpoint_index[target_network] = candidate_index
+                self._notify_endpoint_update()
+                return candidate
+
+        # If all endpoints are marked unhealthy, still rotate to the next one.
+        self.active_endpoint_index[target_network] = (current_index + 1) % len(endpoints)
+        self._notify_endpoint_update()
+        return endpoints[self.active_endpoint_index[target_network]]
+
+
+def create_mint_instructions(
+    *,
+    token_program: TokenProgram,
+    mint_address: str,
+    decimals: int,
+    mint_authority: str,
+    freeze_authority: Optional[str] = None,
+    transfer_hook: Optional[TransferHookConfig] = None,
+    mint_close_authority: Optional[str] = None,
+    interest_bearing: Optional[InterestBearingConfig] = None,
+) -> list[InstructionStep]:
+    """Build a deterministic instruction plan for mint creation.
+
+    The helpers intentionally model the shape and ordering of Token-2022
+    extension initialization without performing RPCs. Each extension is
+    appended in the order provided: transfer hooks, mint close authority,
+    then interest-bearing configuration.
+    """
+
+    program_id = _program_id(token_program)
+
+    if token_program == "Token" and any(
+        [transfer_hook, mint_close_authority, interest_bearing]
+    ):
+        raise TokenProgramUnsupportedError(token_program)
+
+    instructions: list[InstructionStep] = [
+        InstructionStep(
+            name="initialize_mint",
+            program_id=program_id,
+            accounts=[mint_address],
+            data={
+                "decimals": decimals,
+                "mint_authority": mint_authority,
+                "freeze_authority": freeze_authority,
+            },
+            signers=[mint_authority],
+        )
+    ]
+
+    if transfer_hook:
+        instructions.append(
+            InstructionStep(
+                name="initialize_transfer_hook_extension",
+                program_id=program_id,
+                accounts=[mint_address],
+                data={"hook_program": transfer_hook.hook_program},
+                signers=[mint_authority],
+            )
+        )
+        instructions.append(
+            InstructionStep(
+                name="configure_transfer_hook",
+                program_id=program_id,
+                accounts=[mint_address, *(transfer_hook.validation_accounts or [])],
+                data={
+                    "hook_program": transfer_hook.hook_program,
+                    "validation_accounts": transfer_hook.validation_accounts
+                    or [],
+                },
+                signers=[mint_authority],
+            )
+        )
+
+    if mint_close_authority:
+        instructions.append(
+            InstructionStep(
+                name="initialize_mint_close_authority_extension",
+                program_id=program_id,
+                accounts=[mint_address],
+                signers=[mint_authority],
+            )
+        )
+        instructions.append(
+            InstructionStep(
+                name="set_mint_close_authority",
+                program_id=program_id,
+                accounts=[mint_address],
+                data={"close_authority": mint_close_authority},
+                signers=[mint_authority],
+            )
+        )
+
+    if interest_bearing:
+        instructions.append(
+            InstructionStep(
+                name="initialize_interest_bearing_extension",
+                program_id=program_id,
+                accounts=[mint_address],
+                data=interest_bearing.initialization_data or {},
+                signers=[interest_bearing.authority],
+            )
+        )
+        instructions.append(
+            InstructionStep(
+                name="set_interest_rate",
+                program_id=program_id,
+                accounts=[mint_address],
+                data={
+                    "rate_basis_points": interest_bearing.rate_basis_points,
+                    "authority": interest_bearing.authority,
+                },
+                signers=[interest_bearing.authority],
+            )
+        )
+
+    return instructions
+
+
+def set_transfer_hook(
+    *,
+    token_program: TokenProgram,
+    mint_address: str,
+    authority: str,
+    hook_program: str,
+    validation_accounts: Optional[list[str]] = None,
+) -> InstructionStep:
+    """Return a configuration instruction for transfer hook updates."""
+
+    _require_token_2022(token_program)
+    return InstructionStep(
+        name="set_transfer_hook",
+        program_id=_program_id(token_program),
+        accounts=[mint_address, *(validation_accounts or [])],
+        data={
+            "hook_program": hook_program,
+            "validation_accounts": validation_accounts or [],
+        },
+        signers=[authority],
+    )
+
+
+def set_mint_close_authority(
+    *,
+    token_program: TokenProgram,
+    mint_address: str,
+    authority: str,
+    close_authority: Optional[str],
+) -> InstructionStep:
+    """Return a configuration instruction to update the mint close authority."""
+
+    _require_token_2022(token_program)
+    return InstructionStep(
+        name="set_mint_close_authority",
+        program_id=_program_id(token_program),
+        accounts=[mint_address],
+        data={"close_authority": close_authority},
+        signers=[authority],
+    )
+
+
+def set_interest_rate(
+    *,
+    token_program: TokenProgram,
+    mint_address: str,
+    authority: str,
+    rate_basis_points: int,
+    initialization_data: Optional[dict[str, object]] = None,
+) -> InstructionStep:
+    """Return an interest-bearing mint rate update instruction."""
+
+    _require_token_2022(token_program)
+    return InstructionStep(
+        name="set_interest_rate",
+        program_id=_program_id(token_program),
+        accounts=[mint_address],
+        data={
+            "rate_basis_points": rate_basis_points,
+            "initialization_data": initialization_data or {},
+        },
+        signers=[authority],
+    )
 
 
 class WalletController:
@@ -327,7 +656,7 @@ class WalletController:
         endpoint = self.select_endpoint()
         client = Client(endpoint.url)
         try:
-            fees = client.get_fees()
+            fees = self._with_endpoint_failover(lambda client: client.get_fees())
             # Prefer the RPC value if available; fall back to a nominal fee.
             lamports_per_sig = fees.value.fee_calculator.lamports_per_signature
             self._mark_endpoint_healthy(endpoint)
@@ -347,6 +676,77 @@ class WalletController:
         if mint:
             return [ata for ata in accounts if ata.mint == mint]
         return accounts
+
+    def fetch_mint_info(self, mint_address: str) -> MintInfo:
+        """Fetch mint metadata and extension hints via RPC."""
+
+        endpoint = self.select_endpoint()
+        client = Client(endpoint.url)
+        try:
+            response = client.get_account_info(Pubkey.from_string(mint_address))
+            value = response.value
+            if value is None:
+                raise ValueError("Mint account not found")
+
+            # Normalize owner/program string regardless of RPC format.
+            owner = (
+                str(value.owner)
+                if hasattr(value, "owner")
+                else str(value.get("owner"))
+            )
+            token_program: TokenProgram = (
+                "Token-2022" if owner == TOKEN_PROGRAM_IDS["Token-2022"] else "Token"
+            )
+
+            info = MintInfo(
+                mint_address=mint_address,
+                token_program=token_program,
+            )
+
+            # Extension parsing for token-2022 would normally decode the mint layout.
+            # For this prototype, surface placeholder hints when RPC metadata includes
+            # them so the UI can reflect configured options.
+            if isinstance(value, dict):
+                data = value.get("data", {})
+                if isinstance(data, dict):
+                    extensions = data.get("extensions", {})
+                    info.transfer_hook_program = extensions.get("transferHookProgram")
+                    info.transfer_hook_accounts = extensions.get("transferHookAccounts")
+                    info.close_authority = extensions.get("closeAuthority")
+                    info.interest_rate = extensions.get("interestRate")
+                    info.interest_authority = extensions.get("interestAuthority")
+
+            self._mark_endpoint_healthy(endpoint)
+            return info
+        except Exception:
+            self.mark_endpoint_failed(endpoint)
+            raise
+
+    def build_mint_payload(self, form_state: "MintFormState") -> dict:
+        """Translate form state into a payload for mint creation or updates."""
+
+        payload: dict[str, object] = {
+            "mint": form_state.mint_address,
+            "token_program": self.state.token_program,
+            "token_program_id": self.current_token_program_id(),
+        }
+
+        if form_state.transfer_hook_enabled and form_state.transfer_hook_program:
+            payload["transfer_hook"] = {
+                "program": form_state.transfer_hook_program,
+                "accounts": form_state.transfer_hook_accounts or [],
+            }
+
+        if form_state.close_authority_enabled and form_state.close_authority:
+            payload["close_authority"] = form_state.close_authority
+
+        if form_state.interest_bearing_enabled and form_state.interest_rate is not None:
+            payload["interest_bearing"] = {
+                "rate": form_state.interest_rate,
+                "authority": form_state.interest_authority,
+            }
+
+        return payload
 
     def ensure_associated_account(self, mint: str) -> AssociatedTokenAccount:
         """Create or return the existing ATA for the given mint."""
