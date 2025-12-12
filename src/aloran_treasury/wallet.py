@@ -15,10 +15,19 @@ Network = Literal["Mainnet", "Testnet", "Devnet"]
 TokenProgram = Literal["Token-2022", "Token"]
 NETWORKS: list[Network] = ["Mainnet", "Testnet", "Devnet"]
 
-DEFAULT_ENDPOINTS: dict[Network, str] = {
-    "Mainnet": "https://api.mainnet-beta.solana.com",
-    "Testnet": "https://api.testnet.solana.com",
-    "Devnet": "https://api.devnet.solana.com",
+NETWORK_ENDPOINTS: dict[Network, list[tuple[str, str]]] = {
+    "Mainnet": [
+        ("api.mainnet-beta.solana.com", "https://api.mainnet-beta.solana.com"),
+        ("projectserum RPC", "https://solana-api.projectserum.com"),
+    ],
+    "Testnet": [
+        ("api.testnet.solana.com", "https://api.testnet.solana.com"),
+        ("rpc.ankr testnet", "https://rpc.ankr.com/solana/testnet"),
+    ],
+    "Devnet": [
+        ("api.devnet.solana.com", "https://api.devnet.solana.com"),
+        ("rpc.ankr devnet", "https://rpc.ankr.com/solana/devnet"),
+    ],
 }
 
 TOKEN_PROGRAM_IDS: dict[TokenProgram, str] = {
@@ -29,6 +38,17 @@ TOKEN_PROGRAM_IDS: dict[TokenProgram, str] = {
 DEFAULT_RENT_EXEMPT_LAMPORTS = 2_039_280
 
 LAMPORTS_PER_SOL = 1_000_000_000
+
+
+@dataclass
+class EndpointStatus:
+    """Track the health of a single RPC endpoint."""
+
+    label: str
+    url: str
+    healthy: Optional[bool] = None
+    last_latency_ms: Optional[float] = None
+    last_checked: Optional[float] = None
 
 
 @dataclass
@@ -76,6 +96,16 @@ class WalletState:
     associated_accounts: dict[Network, list["AssociatedTokenAccount"]] = field(
         default_factory=lambda: {network: [] for network in NETWORKS}
     )
+    endpoint_statuses: dict[Network, list[EndpointStatus]] = field(
+        default_factory=lambda: {
+            network: [EndpointStatus(label, url) for label, url in NETWORK_ENDPOINTS[network]]
+            for network in NETWORKS
+        }
+    )
+    active_endpoint_index: dict[Network, int] = field(
+        default_factory=lambda: {network: 0 for network in NETWORKS}
+    )
+    _endpoint_listeners: list[Callable[[], None]] = field(default_factory=list, repr=False)
 
     def status_line(self) -> str:
         if self.locked:
@@ -97,6 +127,7 @@ class WalletState:
         """Update the active cluster."""
 
         self.network = network
+        self._notify_endpoint_update()
 
     def set_token_program(self, token_program: TokenProgram) -> None:
         """Persist the user's chosen token program for ATA previews."""
@@ -126,6 +157,74 @@ class WalletState:
         """Record a future action in the activity list."""
 
         self.pending_actions.append(description)
+
+    def subscribe_endpoint_updates(self, listener: Callable[[], None]) -> None:
+        """Register a callback invoked when endpoint state changes."""
+
+        self._endpoint_listeners.append(listener)
+
+    def _notify_endpoint_update(self) -> None:
+        for listener in self._endpoint_listeners:
+            listener()
+
+    def endpoint_statuses_for_network(self, network: Optional[Network] = None) -> list[EndpointStatus]:
+        """Return all known endpoints for the given or active network."""
+
+        return self.endpoint_statuses[network or self.network]
+
+    def current_endpoint_status(self, network: Optional[Network] = None) -> EndpointStatus:
+        """Return the active endpoint status record for the network."""
+
+        active_network = network or self.network
+        index = self.active_endpoint_index[active_network]
+        return self.endpoint_statuses_for_network(active_network)[index]
+
+    @property
+    def current_endpoint_url(self) -> str:
+        """Convenience accessor for the current RPC URL."""
+
+        return self.current_endpoint_status().url
+
+    def record_endpoint_check(
+        self,
+        url: str,
+        healthy: bool,
+        latency_ms: Optional[float],
+        timestamp: float,
+        network: Optional[Network] = None,
+    ) -> None:
+        """Update health metadata for the endpoint matching the given URL."""
+
+        target_network = network or self.network
+        for status in self.endpoint_statuses_for_network(target_network):
+            if status.url == url:
+                status.healthy = healthy
+                status.last_latency_ms = latency_ms
+                status.last_checked = timestamp
+                break
+        self._notify_endpoint_update()
+
+    def advance_to_next_endpoint(self, network: Optional[Network] = None) -> EndpointStatus:
+        """Rotate to the next healthy (or least unhealthy) endpoint for the network."""
+
+        target_network = network or self.network
+        endpoints = self.endpoint_statuses_for_network(target_network)
+        if not endpoints:
+            raise RuntimeError("No endpoints configured")
+
+        current_index = self.active_endpoint_index[target_network]
+        for offset in range(1, len(endpoints) + 1):
+            candidate_index = (current_index + offset) % len(endpoints)
+            candidate = endpoints[candidate_index]
+            if candidate.healthy is not False:
+                self.active_endpoint_index[target_network] = candidate_index
+                self._notify_endpoint_update()
+                return candidate
+
+        # If all endpoints are marked unhealthy, still rotate to the next one.
+        self.active_endpoint_index[target_network] = (current_index + 1) % len(endpoints)
+        self._notify_endpoint_update()
+        return endpoints[self.active_endpoint_index[target_network]]
 
 
 class WalletController:
@@ -172,7 +271,36 @@ class WalletController:
     def endpoint(self) -> str:
         """Return the RPC endpoint for the active network."""
 
-        return DEFAULT_ENDPOINTS[self.state.network]
+        return self.state.current_endpoint_url
+
+    def _with_endpoint_failover(self, rpc_call: Callable[[Client], object]):
+        """Execute an RPC call and rotate endpoints when failures occur."""
+
+        endpoints = self.state.endpoint_statuses_for_network()
+        if not endpoints:
+            raise RuntimeError("No endpoints configured")
+
+        attempts = len(endpoints)
+        last_error: Optional[Exception] = None
+        for _ in range(attempts):
+            endpoint = self.state.current_endpoint_status()
+            client = Client(endpoint.url)
+            start = time.perf_counter()
+            try:
+                result = rpc_call(client)
+                latency_ms = (time.perf_counter() - start) * 1000
+                self.state.record_endpoint_check(
+                    endpoint.url, True, latency_ms, time.time()
+                )
+                return result
+            except Exception as exc:  # noqa: BLE001 - bubble up after failover attempts
+                last_error = exc
+                self.state.record_endpoint_check(endpoint.url, False, None, time.time())
+                self.state.advance_to_next_endpoint()
+
+        if last_error:
+            raise last_error
+        raise RuntimeError("RPC call failed with no recorded error")
 
     def refresh_balance(self) -> Optional[float]:
         """Fetch the SOL balance for the active keypair using the configured RPC endpoint."""
@@ -180,8 +308,11 @@ class WalletController:
         if self._keypair is None:
             return None
 
-        client = Client(self.endpoint())
-        response = client.get_balance(Pubkey.from_string(str(self._keypair.pubkey())))
+        response = self._with_endpoint_failover(
+            lambda client: client.get_balance(
+                Pubkey.from_string(str(self._keypair.pubkey()))
+            )
+        )
         lamports = response.value
         self.state.sol_balance = lamports / LAMPORTS_PER_SOL
         return self.state.sol_balance
@@ -193,9 +324,8 @@ class WalletController:
         access fails, allowing the UI to continue presenting transfer flows.
         """
 
-        client = Client(self.endpoint())
         try:
-            response = client.get_latest_blockhash()
+            response = self._with_endpoint_failover(lambda client: client.get_latest_blockhash())
             return str(response.value.blockhash)
         except Exception:
             # Keep the UI responsive even when offline.
@@ -204,9 +334,8 @@ class WalletController:
     def estimate_fee(self, instructions: int = 1) -> int:
         """Roughly estimate the lamports required for a transfer."""
 
-        client = Client(self.endpoint())
         try:
-            fees = client.get_fees()
+            fees = self._with_endpoint_failover(lambda client: client.get_fees())
             # Prefer the RPC value if available; fall back to a nominal fee.
             lamports_per_sig = fees.value.fee_calculator.lamports_per_signature
         except Exception:
