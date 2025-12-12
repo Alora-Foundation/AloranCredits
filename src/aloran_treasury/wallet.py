@@ -73,6 +73,19 @@ LAMPORTS_PER_SOL = 1_000_000_000
 
 
 @dataclass
+class MintInfo:
+    """Snapshot of mint settings derived from RPC responses."""
+
+    mint_address: str
+    token_program: TokenProgram
+    transfer_hook_program: Optional[str] = None
+    transfer_hook_accounts: Optional[list[str]] = None
+    close_authority: Optional[str] = None
+    interest_rate: Optional[float] = None
+    interest_authority: Optional[str] = None
+
+
+@dataclass
 class TransactionHistoryEntry:
     """Lightweight representation of a historical transaction."""
 
@@ -313,6 +326,77 @@ class WalletController:
         if mint:
             return [ata for ata in accounts if ata.mint == mint]
         return accounts
+
+    def fetch_mint_info(self, mint_address: str) -> MintInfo:
+        """Fetch mint metadata and extension hints via RPC."""
+
+        endpoint = self.select_endpoint()
+        client = Client(endpoint.url)
+        try:
+            response = client.get_account_info(Pubkey.from_string(mint_address))
+            value = response.value
+            if value is None:
+                raise ValueError("Mint account not found")
+
+            # Normalize owner/program string regardless of RPC format.
+            owner = (
+                str(value.owner)
+                if hasattr(value, "owner")
+                else str(value.get("owner"))
+            )
+            token_program: TokenProgram = (
+                "Token-2022" if owner == TOKEN_PROGRAM_IDS["Token-2022"] else "Token"
+            )
+
+            info = MintInfo(
+                mint_address=mint_address,
+                token_program=token_program,
+            )
+
+            # Extension parsing for token-2022 would normally decode the mint layout.
+            # For this prototype, surface placeholder hints when RPC metadata includes
+            # them so the UI can reflect configured options.
+            if isinstance(value, dict):
+                data = value.get("data", {})
+                if isinstance(data, dict):
+                    extensions = data.get("extensions", {})
+                    info.transfer_hook_program = extensions.get("transferHookProgram")
+                    info.transfer_hook_accounts = extensions.get("transferHookAccounts")
+                    info.close_authority = extensions.get("closeAuthority")
+                    info.interest_rate = extensions.get("interestRate")
+                    info.interest_authority = extensions.get("interestAuthority")
+
+            self._mark_endpoint_healthy(endpoint)
+            return info
+        except Exception:
+            self.mark_endpoint_failed(endpoint)
+            raise
+
+    def build_mint_payload(self, form_state: "MintFormState") -> dict:
+        """Translate form state into a payload for mint creation or updates."""
+
+        payload: dict[str, object] = {
+            "mint": form_state.mint_address,
+            "token_program": self.state.token_program,
+            "token_program_id": self.current_token_program_id(),
+        }
+
+        if form_state.transfer_hook_enabled and form_state.transfer_hook_program:
+            payload["transfer_hook"] = {
+                "program": form_state.transfer_hook_program,
+                "accounts": form_state.transfer_hook_accounts or [],
+            }
+
+        if form_state.close_authority_enabled and form_state.close_authority:
+            payload["close_authority"] = form_state.close_authority
+
+        if form_state.interest_bearing_enabled and form_state.interest_rate is not None:
+            payload["interest_bearing"] = {
+                "rate": form_state.interest_rate,
+                "authority": form_state.interest_authority,
+            }
+
+        return payload
 
     def ensure_associated_account(self, mint: str) -> AssociatedTokenAccount:
         """Create or return the existing ATA for the given mint."""
