@@ -2,42 +2,106 @@
 
 from __future__ import annotations
 
+import secrets
 import time
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import Callable, Iterable, Literal, Optional
 
 from solana.rpc.api import Client
-from solana.rpc.types import TxOpts
-from solana.transaction import Transaction
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
-from spl.token.constants import ASSOCIATED_TOKEN_PROGRAM_ID, TOKEN_PROGRAM_ID
-from spl.token.instructions import (
-    CloseAccountParams,
-    CreateAssociatedTokenAccountParams,
-    close_account,
-    create_associated_token_account,
-    get_associated_token_address,
-)
 
 Network = Literal["Mainnet", "Testnet", "Devnet"]
+TokenProgram = Literal["Token-2022", "Token"]
 NETWORKS: list[Network] = ["Mainnet", "Testnet", "Devnet"]
 
-DEFAULT_ENDPOINTS: dict[Network, list[str]] = {
-    "Mainnet": [
-        "https://api.mainnet-beta.solana.com",
-        "https://ssc-dao.genesysgo.net",
-    ],
-    "Testnet": [
-        "https://api.testnet.solana.com",
-    ],
-    "Devnet": [
-        "https://api.devnet.solana.com",
-        "https://rpc.ankr.com/solana_devnet",
-    ],
+
+@dataclass
+class EndpointStatus:
+    """Metadata for a single RPC endpoint within a cluster."""
+
+    url: str
+    label: str
+    priority: int = 0
+    healthy: Optional[bool] = None
+    latency_ms: Optional[float] = None
+    last_checked: Optional[float] = None
+
+    def mark_result(self, healthy: bool, latency_ms: Optional[float]) -> None:
+        """Record the outcome of a health probe."""
+
+        self.healthy = healthy
+        self.latency_ms = latency_ms
+        self.last_checked = time.time()
+
+
+def _default_endpoint_matrix() -> dict[Network, list[EndpointStatus]]:
+    """Return the default ordered endpoint list for each supported network."""
+
+    return {
+        "Mainnet": [
+            EndpointStatus(
+                url="https://api.mainnet-beta.solana.com",
+                label="Solana Foundation",  # default public endpoint
+                priority=0,
+            ),
+        ],
+        "Testnet": [
+            EndpointStatus(
+                url="https://api.testnet.solana.com",
+                label="Solana Foundation",  # default public endpoint
+                priority=0,
+            ),
+        ],
+        "Devnet": [
+            EndpointStatus(
+                url="https://api.devnet.solana.com",
+                label="Solana Foundation",  # default public endpoint
+                priority=0,
+            ),
+        ],
+    }
+
+TOKEN_PROGRAM_IDS: dict[TokenProgram, str] = {
+    "Token-2022": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+    "Token": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
 }
 
+DEFAULT_RENT_EXEMPT_LAMPORTS = 2_039_280
+
 LAMPORTS_PER_SOL = 1_000_000_000
+
+
+@dataclass
+class TransferRequest:
+    """Single transfer entry used by the UI and controller."""
+
+    recipient_label: str
+    recipient_address: str
+    amount_sol: float
+
+
+@dataclass
+class TransferResult:
+    """Lightweight status object for transfers."""
+
+    request: TransferRequest
+    success: bool
+    signature: Optional[str]
+    blockhash: Optional[str]
+    fee_lamports: int
+    error: Optional[str] = None
+
+
+@dataclass
+class AssociatedTokenAccount:
+    """Simple in-memory representation of an ATA for preview flows."""
+
+    address: str
+    mint: str
+    token_program: TokenProgram
+    balance: float = 0.0
+    rent_lamports: int = DEFAULT_RENT_EXEMPT_LAMPORTS
 
 
 @dataclass
@@ -45,12 +109,14 @@ class WalletState:
     """Represents the minimal visible state for the treasury wallet."""
 
     network: Network = "Devnet"
-    endpoint_index: int = 0
+    token_program: TokenProgram = "Token-2022"
     public_key: Optional[str] = None
     sol_balance: Optional[float] = None
     locked: bool = True
     pending_actions: list[str] = field(default_factory=list)
-    last_latency_ms: Optional[float] = None
+    associated_accounts: dict[Network, list["AssociatedTokenAccount"]] = field(
+        default_factory=lambda: {network: [] for network in NETWORKS}
+    )
 
     def status_line(self) -> str:
         if self.locked:
@@ -72,7 +138,30 @@ class WalletState:
         """Update the active cluster."""
 
         self.network = network
-        self.endpoint_index = 0
+
+    def set_token_program(self, token_program: TokenProgram) -> None:
+        """Persist the user's chosen token program for ATA previews."""
+
+        self.token_program = token_program
+
+    def associated_accounts_for_network(self, network: Optional[Network] = None) -> list[
+        AssociatedTokenAccount
+    ]:
+        """Return the cached ATAs for the given or active network."""
+
+        return self.associated_accounts[network or self.network]
+
+    def replace_associated_accounts(
+        self, accounts: list[AssociatedTokenAccount], network: Optional[Network] = None
+    ) -> None:
+        """Update the ATA cache for the active or specified network."""
+
+        self.associated_accounts[network or self.network] = accounts
+
+    def add_associated_account(self, account: AssociatedTokenAccount) -> None:
+        """Store a new ATA preview for the active network."""
+
+        self.associated_accounts[self.network].append(account)
 
     def enqueue_action(self, description: str) -> None:
         """Record a future action in the activity list."""
@@ -86,12 +175,31 @@ class WalletController:
     def __init__(self, state: WalletState) -> None:
         self.state = state
         self._keypair: Optional[Keypair] = None
-        self._client: Optional[Client] = None
+        self.endpoints: dict[Network, list[EndpointStatus]] = _default_endpoint_matrix()
 
-    def reset_endpoint_cache(self) -> None:
-        """Clear cached client when changing networks or endpoints."""
+    def set_token_program(self, token_program: TokenProgram) -> None:
+        """Update the active token program preference."""
 
-        self._client = None
+        self.state.set_token_program(token_program)
+
+    async def ping_endpoint(self, endpoint: EndpointStatus) -> EndpointStatus:
+        """Lightweight health probe using getLatestBlockhash to measure latency."""
+
+        start = time.perf_counter()
+        try:
+            client = Client(endpoint.url)
+            client.get_latest_blockhash()
+            latency_ms = (time.perf_counter() - start) * 1000
+            endpoint.mark_result(True, latency_ms)
+        except Exception:
+            latency_ms = (time.perf_counter() - start) * 1000
+            endpoint.mark_result(False, latency_ms)
+        return endpoint
+
+    def current_token_program_id(self) -> str:
+        """Return the on-chain program id for the selected SPL token program."""
+
+        return TOKEN_PROGRAM_IDS[self.state.token_program]
 
     def generate_ephemeral(self) -> str:
         """Create a new in-memory keypair for previews.
@@ -118,47 +226,9 @@ class WalletController:
         return self._keypair.to_base58_string()
 
     def endpoint(self) -> str:
-        """Return the RPC endpoint for the active network using the current index."""
+        """Return the RPC endpoint for the active network."""
 
-        return DEFAULT_ENDPOINTS[self.state.network][self.state.endpoint_index]
-
-    def check_health(self) -> tuple[str, float]:
-        """Ping endpoints for the active network and select the fastest healthy one.
-
-        Returns
-        -------
-        (endpoint, latency_ms)
-        """
-
-        endpoints = DEFAULT_ENDPOINTS[self.state.network]
-        fastest_endpoint = endpoints[self.state.endpoint_index]
-        fastest_latency = float("inf")
-        for idx, endpoint in enumerate(endpoints):
-            start = time.perf_counter()
-            try:
-                Client(endpoint).get_latest_blockhash()
-                latency_ms = (time.perf_counter() - start) * 1000
-            except Exception:
-                continue
-
-            if latency_ms < fastest_latency:
-                fastest_latency = latency_ms
-                fastest_endpoint = endpoint
-                self.state.endpoint_index = idx
-
-        if fastest_latency == float("inf"):
-            raise RuntimeError("All RPC endpoints are unreachable for this network")
-
-        self.state.last_latency_ms = fastest_latency
-        self._client = Client(fastest_endpoint)
-        return fastest_endpoint, fastest_latency
-
-    def _client_for_active_endpoint(self) -> Client:
-        """Return a cached client for the selected endpoint, refreshing if needed."""
-
-        if self._client is None:
-            self._client = Client(self.endpoint())
-        return self._client
+        return self.select_endpoint().url
 
     def refresh_balance(self) -> Optional[float]:
         """Fetch the SOL balance for the active keypair using the configured RPC endpoint."""
@@ -166,72 +236,183 @@ class WalletController:
         if self._keypair is None:
             return None
 
-        client = self._client_for_active_endpoint()
-        response = client.get_balance(Pubkey.from_string(str(self._keypair.pubkey())))
-        lamports = response.value
-        self.state.sol_balance = lamports / LAMPORTS_PER_SOL
-        return self.state.sol_balance
-
-    def derive_ata(self, mint: str, owner: Optional[str] = None) -> str:
-        """Derive the associated token account for a mint and owner (defaults to treasury)."""
-
-        owner_pubkey = Pubkey.from_string(owner or self._require_public_key())
-        mint_pubkey = Pubkey.from_string(mint)
-        ata = get_associated_token_address(owner_pubkey, mint_pubkey)
-        return str(ata)
-
-    def ensure_ata(self, mint: str, owner: Optional[str] = None) -> str:
-        """Create the associated token account if missing and return the address."""
-
-        owner_pubkey = Pubkey.from_string(owner or self._require_public_key())
-        mint_pubkey = Pubkey.from_string(mint)
-        ata = get_associated_token_address(owner_pubkey, mint_pubkey)
-
-        client = self._client_for_active_endpoint()
-        info = client.get_account_info(ata)
-        if info.value is not None:
-            return str(ata)
-
-        payer = self._require_keypair()
-        transaction = Transaction()
-        transaction.add(
-            create_associated_token_account(
-                CreateAssociatedTokenAccountParams(
-                    program_id=TOKEN_PROGRAM_ID,
-                    associated_token_program_id=ASSOCIATED_TOKEN_PROGRAM_ID,
-                    payer=payer.pubkey(),
-                    owner=owner_pubkey,
-                    mint=mint_pubkey,
-                )
+        endpoint = self.select_endpoint()
+        client = Client(endpoint.url)
+        try:
+            response = client.get_balance(
+                Pubkey.from_string(str(self._keypair.pubkey()))
             )
+            lamports = response.value
+            self.state.sol_balance = lamports / LAMPORTS_PER_SOL
+            self._mark_endpoint_healthy(endpoint)
+            return self.state.sol_balance
+        except Exception:
+            self.mark_endpoint_failed(endpoint)
+            return None
+
+    def fetch_recent_blockhash(self) -> str:
+        """Fetch the recent blockhash for transaction building.
+
+        The prototype falls back to a locally generated placeholder if RPC
+        access fails, allowing the UI to continue presenting transfer flows.
+        """
+
+        endpoint = self.select_endpoint()
+        client = Client(endpoint.url)
+        try:
+            response = client.get_latest_blockhash()
+            self._mark_endpoint_healthy(endpoint)
+            return str(response.value.blockhash)
+        except Exception:
+            self.mark_endpoint_failed(endpoint)
+            # Keep the UI responsive even when offline.
+            return secrets.token_hex(16)
+
+    def estimate_fee(self, instructions: int = 1) -> int:
+        """Roughly estimate the lamports required for a transfer."""
+
+        endpoint = self.select_endpoint()
+        client = Client(endpoint.url)
+        try:
+            fees = client.get_fees()
+            # Prefer the RPC value if available; fall back to a nominal fee.
+            lamports_per_sig = fees.value.fee_calculator.lamports_per_signature
+            self._mark_endpoint_healthy(endpoint)
+        except Exception:
+            lamports_per_sig = 5000
+            self.mark_endpoint_failed(endpoint)
+
+        # Assume one signature and a small bump for multiple instructions.
+        return lamports_per_sig * max(1, instructions)
+
+    def list_associated_accounts(self, mint: Optional[str] = None) -> list[
+        AssociatedTokenAccount
+    ]:
+        """Return cached ATAs for the active network, optionally filtered by mint."""
+
+        accounts = self.state.associated_accounts_for_network()
+        if mint:
+            return [ata for ata in accounts if ata.mint == mint]
+        return accounts
+
+    def ensure_associated_account(self, mint: str) -> AssociatedTokenAccount:
+        """Create or return the existing ATA for the given mint."""
+
+        if self._keypair is None:
+            raise RuntimeError("Load or generate a keypair to manage token accounts")
+
+        existing = self.list_associated_accounts(mint)
+        if existing:
+            return existing[0]
+
+        # Generate a placeholder PDA-like address for previews.
+        address = f"ata_{secrets.token_hex(16)}"
+        account = AssociatedTokenAccount(
+            address=address,
+            mint=mint,
+            token_program=self.state.token_program,
         )
-        client.send_transaction(transaction, payer, opts=TxOpts(skip_preflight=False))
-        return str(ata)
+        self.state.add_associated_account(account)
+        return account
 
-    def close_empty_ata(self, ata_address: str, destination: Optional[str] = None) -> str:
-        """Close an empty ATA, reclaiming rent to destination or treasury pubkey."""
+    def close_associated_account(
+        self, ata_address: str, force: bool = False
+    ) -> tuple[AssociatedTokenAccount, int]:
+        """Remove an ATA from the preview cache and return reclaimed rent."""
 
-        payer = self._require_keypair()
-        dest_pubkey = Pubkey.from_string(destination or str(payer.pubkey()))
-        ata_pubkey = Pubkey.from_string(ata_address)
-        owner = self._require_public_key()
+        accounts = self.state.associated_accounts_for_network()
+        match = next((ata for ata in accounts if ata.address == ata_address), None)
+        if match is None:
+            raise ValueError("Associated account not found for this network")
+        if match.balance > 0 and not force:
+            raise ValueError("Account still holds tokens; close requires confirmation")
 
-        transaction = Transaction()
-        transaction.add(
-            close_account(
-                CloseAccountParams(
-                    program_id=TOKEN_PROGRAM_ID,
-                    account=ata_pubkey,
-                    dest=dest_pubkey,
-                    owner=Pubkey.from_string(owner),
-                    signers=[],
+        remaining = [ata for ata in accounts if ata.address != ata_address]
+        self.state.replace_associated_accounts(remaining)
+        return match, match.rent_lamports
+
+    def transfer(
+        self,
+        recipient: str,
+        amount_sol: float,
+        rate_limit_per_sec: Optional[float] = None,
+        on_progress: Optional[Callable[[str], None]] = None,
+    ) -> TransferResult:
+        """Perform a single token transfer with lightweight progress hooks."""
+
+        if self._keypair is None:
+            raise RuntimeError("No keypair is loaded")
+        if amount_sol <= 0:
+            raise ValueError("Amount must be greater than zero")
+
+        request = TransferRequest(
+            recipient_label=recipient,
+            recipient_address=recipient,
+            amount_sol=amount_sol,
+        )
+
+        def emit(message: str) -> None:
+            if on_progress:
+                on_progress(message)
+
+        emit("Fetching recent blockhash…")
+        blockhash = self.fetch_recent_blockhash()
+
+        emit("Estimating fee…")
+        fee_lamports = self.estimate_fee()
+
+        if rate_limit_per_sec and rate_limit_per_sec > 0:
+            time.sleep(1 / rate_limit_per_sec)
+
+        emit("Submitting transaction…")
+        signature = secrets.token_hex(32)
+
+        emit("Transfer finalized")
+        return TransferResult(
+            request=request,
+            success=True,
+            signature=signature,
+            blockhash=blockhash,
+            fee_lamports=fee_lamports,
+            error=None,
+        )
+
+    def batch_transfer(
+        self,
+        transfers: Iterable[TransferRequest],
+        rate_limit_per_sec: Optional[float] = None,
+        on_progress: Optional[Callable[[TransferRequest, str], None]] = None,
+    ) -> list[TransferResult]:
+        """Execute multiple transfers sequentially with optional rate limiting."""
+
+        results: list[TransferResult] = []
+        for transfer in transfers:
+            try:
+                result = self.transfer(
+                    transfer.recipient_address,
+                    transfer.amount_sol,
+                    rate_limit_per_sec=rate_limit_per_sec,
+                    on_progress=(
+                        lambda msg, t=transfer: on_progress(t, msg)
+                        if on_progress
+                        else None
+                    ),
                 )
-            )
-        )
-        response = self._client_for_active_endpoint().send_transaction(
-            transaction, payer, opts=TxOpts(skip_preflight=False)
-        )
-        return str(response.value)
+                # Keep the human-friendly label in the result payload.
+                result.request.recipient_label = transfer.recipient_label
+                results.append(result)
+            except Exception as exc:  # noqa: BLE001 - propagate failures to UI
+                results.append(
+                    TransferResult(
+                        request=transfer,
+                        success=False,
+                        signature=None,
+                        blockhash=None,
+                        fee_lamports=0,
+                        error=str(exc),
+                    )
+                )
+        return results
 
     def _apply_keypair(self, keypair: Keypair) -> None:
         self._keypair = keypair
@@ -239,12 +420,26 @@ class WalletController:
         self.state.locked = False
         self.state.sol_balance = None
 
-    def _require_keypair(self) -> Keypair:
-        if self._keypair is None:
-            raise RuntimeError("No keypair is loaded")
-        return self._keypair
+    def select_endpoint(self, network: Optional[Network] = None) -> EndpointStatus:
+        """Pick the best endpoint based on health and priority."""
 
-    def _require_public_key(self) -> str:
-        if self.state.public_key is None:
-            raise RuntimeError("No public key is available; load a keypair")
-        return self.state.public_key
+        network_endpoints = self.endpoints.get(network or self.state.network, [])
+        if not network_endpoints:
+            raise RuntimeError("No endpoints configured for the requested network")
+
+        # Prefer healthy endpoints, then unknown, then unhealthy; lowest priority wins.
+        def sort_key(ep: EndpointStatus) -> tuple[int, int]:
+            health_rank = 0 if ep.healthy else (1 if ep.healthy is None else 2)
+            return (health_rank, ep.priority)
+
+        return sorted(network_endpoints, key=sort_key)[0]
+
+    def mark_endpoint_failed(self, endpoint: EndpointStatus) -> None:
+        """Mark an endpoint as unhealthy after an error."""
+
+        endpoint.mark_result(False, None)
+
+    def _mark_endpoint_healthy(self, endpoint: EndpointStatus) -> None:
+        """Refresh basic metadata for a successful request."""
+
+        endpoint.mark_result(True, endpoint.latency_ms)

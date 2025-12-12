@@ -19,9 +19,7 @@ See [`docs/product_spec.md`](docs/product_spec.md) for the detailed specificatio
 
 ## Prototype UI (local run)
 The PySide6 prototype now includes a richer layout with network selection, wallet lock/unlock simulation, session key
-generation/import, balance refresh, RPC health checks with endpoint failover, and associated token account helpers
-to create or close treasury ATAs. The activity list captures each action for quick auditing while iterating on token
-flows.
+generation/import, balance refresh, and a queued action list to visualize token operations before Solana wiring is added.
 
 1. Install dependencies (ideally in a virtual environment):
    ```bash
@@ -32,4 +30,4 @@ flows.
    python -m aloran_treasury
    ```
 
-> The prototype now exercises Solana RPCs for balance lookups, endpoint health checks, and ATA lifecycle actions. Production authority flows and mint controls remain to be wired in.
+> The prototype intentionally omits Solana RPC calls and signing until wallet security, RPC providers, and token authority flows are finalized.

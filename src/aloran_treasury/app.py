@@ -2,28 +2,47 @@
 
 from __future__ import annotations
 
+import csv
+from pathlib import Path
 import sys
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
     QFrame,
     QGridLayout,
     QHBoxLayout,
-    QLabel,
     QInputDialog,
+    QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from .theme import BACKGROUND, FONT_FAMILY, FONT_SIZE, PALETTE, SURFACE, SURFACE_ALT, TEXT_MUTED, TEXT_PRIMARY, muted
-from .wallet import NETWORKS, WalletController, WalletState
+from .wallet import (
+    LAMPORTS_PER_SOL,
+    NETWORKS,
+    AssociatedTokenAccount,
+    TokenProgram,
+    TransferRequest,
+    WalletController,
+    WalletState,
+)
 
 
 def configure_palette(app: QApplication) -> None:
@@ -87,6 +106,175 @@ def create_action_buttons(actions: Iterable[str]) -> List[QPushButton]:
     return buttons
 
 
+class TransferDialog(QDialog):
+    """Collect single or batch transfer details with validation."""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Send SPL Tokens")
+        self.setMinimumSize(720, 520)
+        self.transfers: list[TransferRequest] = []
+        self.rate_limit: Optional[float] = None
+        self._build()
+
+    def _build(self) -> None:
+        layout = QVBoxLayout()
+
+        tabs = QTabWidget()
+        tabs.addTab(self._single_transfer_tab(), "Single transfer")
+        tabs.addTab(self._csv_tab(), "CSV import")
+        self.tabs = tabs
+
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(
+            ["Recipient", "Address", "Amount (SOL)", "Status"]
+        )
+        self.table.horizontalHeader().setStretchLastSection(True)
+
+        rate_limit_row = QHBoxLayout()
+        rate_label = QLabel("Optional rate limit (tx/sec)")
+        self.rate_limit_spin = QDoubleSpinBox()
+        self.rate_limit_spin.setMaximum(10.0)
+        self.rate_limit_spin.setSingleStep(0.25)
+        self.rate_limit_spin.setSpecialValueText("No limit")
+        rate_limit_row.addWidget(rate_label)
+        rate_limit_row.addWidget(self.rate_limit_spin)
+        rate_limit_row.addStretch()
+
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        button_box.accepted.connect(self._accept)
+        button_box.rejected.connect(self.reject)
+
+        layout.addWidget(tabs)
+        layout.addWidget(QLabel("Staged transfers"))
+        layout.addWidget(self.table)
+        layout.addLayout(rate_limit_row)
+        layout.addWidget(button_box)
+        self.setLayout(layout)
+
+    def _single_transfer_tab(self) -> QWidget:
+        container = QWidget()
+        form = QFormLayout()
+
+        self.single_recipient_name = QLineEdit()
+        self.single_recipient_address = QLineEdit()
+        self.single_amount = QDoubleSpinBox()
+        self.single_amount.setMaximum(1_000_000_000)
+        self.single_amount.setDecimals(6)
+        self.single_amount.setValue(1.0)
+
+        add_button = QPushButton("Add to staged list")
+        add_button.clicked.connect(self._add_single_transfer)
+
+        form.addRow("Recipient label", self.single_recipient_name)
+        form.addRow("Address", self.single_recipient_address)
+        form.addRow("Amount (SOL)", self.single_amount)
+        form.addRow(add_button)
+
+        container.setLayout(form)
+        return container
+
+    def _csv_tab(self) -> QWidget:
+        container = QWidget()
+        column = QVBoxLayout()
+        helper = QLabel(
+            muted(
+                "Provide a CSV with columns recipient,address,amount. Invalid rows "
+                "stay listed with their error message."
+            )
+        )
+        load_button = QPushButton("Load CSV")
+        load_button.clicked.connect(self._load_csv)
+        self.csv_path_label = QLabel("No file loaded")
+        self.csv_path_label.setObjectName("muted")
+
+        column.addWidget(helper)
+        column.addWidget(load_button)
+        column.addWidget(self.csv_path_label)
+        column.addStretch()
+        container.setLayout(column)
+        return container
+
+    def _add_single_transfer(self) -> None:
+        label = self.single_recipient_name.text().strip() or "Recipient"
+        address = self.single_recipient_address.text().strip()
+        amount = float(self.single_amount.value())
+        status = self._validate(address, amount)
+        self._append_row(
+            TransferRequest(label, address, amount),
+            "Ready" if status is None else f"Invalid: {status}",
+        )
+
+    def _load_csv(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Import transfer CSV", "", "CSV Files (*.csv)")
+        if not path:
+            return
+
+        try:
+            with Path(path).open(newline="") as handle:
+                reader = csv.DictReader(handle)
+                expected = {"recipient", "address", "amount"}
+                if set(reader.fieldnames or []) != expected:
+                    raise ValueError(
+                        "CSV must include recipient,address,amount headers"
+                    )
+                for row in reader:
+                    label = (row.get("recipient") or "").strip() or "Recipient"
+                    address = (row.get("address") or "").strip()
+                    try:
+                        amount = float(row.get("amount", "0") or 0)
+                    except ValueError:
+                        amount = 0.0
+                    error = self._validate(address, amount)
+                    status = "Ready" if error is None else f"Invalid: {error}"
+                    self._append_row(TransferRequest(label, address, amount), status)
+            self.csv_path_label.setText(Path(path).name)
+        except Exception as exc:  # noqa: BLE001 - surface parsing errors
+            QMessageBox.critical(self, "CSV import failed", str(exc))
+
+    def _append_row(self, request: TransferRequest, status: str) -> None:
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QTableWidgetItem(request.recipient_label))
+        self.table.setItem(row, 1, QTableWidgetItem(request.recipient_address))
+        self.table.setItem(row, 2, QTableWidgetItem(f"{request.amount_sol:.6f}"))
+        self.table.setItem(row, 3, QTableWidgetItem(status))
+
+    def _validate(self, address: str, amount: float) -> Optional[str]:
+        if not address:
+            return "Address is required"
+        if len(address) < 20:
+            return "Address appears too short"
+        if amount <= 0:
+            return "Amount must be greater than zero"
+        return None
+
+    def _accept(self) -> None:
+        self.transfers = []
+        for row in range(self.table.rowCount()):
+            status = self.table.item(row, 3).text()
+            if status.lower().startswith("invalid"):
+                continue
+            label = self.table.item(row, 0).text()
+            address = self.table.item(row, 1).text()
+            amount_text = self.table.item(row, 2).text()
+            try:
+                amount = float(amount_text)
+            except ValueError:
+                continue
+            self.transfers.append(TransferRequest(label, address, amount))
+
+        if not self.transfers:
+            QMessageBox.warning(self, "Nothing to send", "Add at least one valid transfer.")
+            return
+
+        rate = float(self.rate_limit_spin.value())
+        self.rate_limit = rate if rate > 0 else None
+        self.accept()
+
+
 class TreasuryConsole(QWidget):
     def __init__(self) -> None:
         super().__init__()
@@ -94,7 +282,9 @@ class TreasuryConsole(QWidget):
         self.wallet_controller = WalletController(self.wallet_state)
         self.setWindowTitle("Aloran Treasury Console (Prototype)")
         self.setMinimumSize(720, 720)
+        self.failed_transfers: list[tuple[TransferRequest, Optional[float]]] = []
         self._build()
+        self._refresh_ata_table()
 
     def _build(self) -> None:
         layout = QVBoxLayout()
@@ -147,8 +337,50 @@ class TreasuryConsole(QWidget):
         pubkey_label.setObjectName("muted")
         balance_label = QLabel(self._balance_line())
         balance_label.setObjectName("muted")
-        endpoint_label = QLabel(self._endpoint_line())
-        endpoint_label.setObjectName("muted")
+
+        ata_header = QLabel("Associated Token Accounts")
+        ata_header.setStyleSheet("font-size: 12pt; font-weight: 700;")
+        ata_summary = QLabel(self._ata_summary_line())
+        ata_summary.setObjectName("muted")
+
+        program_row = QHBoxLayout()
+        program_label = QLabel("Token program")
+        program_label.setObjectName("muted")
+        program_select = QComboBox()
+        program_select.addItems(["Token-2022", "Token"])
+        program_select.setCurrentText(self.wallet_state.token_program)
+        program_select.currentTextChanged.connect(self._change_token_program)
+        program_row.addWidget(program_label)
+        program_row.addWidget(program_select)
+        program_row.addStretch()
+
+        mint_row = QHBoxLayout()
+        mint_label = QLabel("Mint address")
+        mint_label.setObjectName("muted")
+        mint_input = QLineEdit()
+        mint_input.setPlaceholderText("Enter mint to ensure ATA")
+        mint_button = QPushButton("Create/lookup ATA")
+        mint_button.clicked.connect(self._create_ata_for_mint)
+        mint_row.addWidget(mint_label)
+        mint_row.addWidget(mint_input)
+        mint_row.addWidget(mint_button)
+
+        ata_table = QTableWidget(0, 5)
+        ata_table.setHorizontalHeaderLabels(
+            ["Mint", "Address", "Program", "Balance", "Reclaim (SOL)"]
+        )
+        ata_table.horizontalHeader().setStretchLastSection(True)
+        ata_table.setAlternatingRowColors(True)
+
+        ata_actions = QHBoxLayout()
+        refresh_atas = QPushButton("Refresh ATA list")
+        refresh_atas.clicked.connect(self._refresh_ata_table)
+        close_ata = QPushButton("Close selected ATA")
+        close_ata.setObjectName("danger")
+        close_ata.clicked.connect(self._close_selected_ata)
+        ata_actions.addWidget(refresh_atas)
+        ata_actions.addWidget(close_ata)
+        ata_actions.addStretch()
 
         lock_button = QPushButton("Unlock" if self.wallet_state.locked else "Lock")
         lock_button.clicked.connect(self._toggle_lock)
@@ -160,18 +392,14 @@ class TreasuryConsole(QWidget):
         copy_button.clicked.connect(self._copy_public_key)
         refresh_balance_button = QPushButton("Refresh balance")
         refresh_balance_button.clicked.connect(self._refresh_balance)
-        rpc_health_button = QPushButton("Check RPC health")
-        rpc_health_button.clicked.connect(self._check_rpc_health)
-        ensure_ata_button = QPushButton("Create/Find Treasury ATA")
-        ensure_ata_button.clicked.connect(self._ensure_treasury_ata)
-        close_ata_button = QPushButton("Close ATA")
-        close_ata_button.setObjectName("danger")
-        close_ata_button.clicked.connect(self._close_ata)
         self.lock_button = lock_button
         self.wallet_status = wallet_status
         self.public_key_label = pubkey_label
         self.balance_label = balance_label
-        self.endpoint_label = endpoint_label
+        self.ata_table = ata_table
+        self.mint_input = mint_input
+        self.program_select = program_select
+        self.ata_summary_label = ata_summary
 
         layout.addWidget(title, 0, 0, 1, 2)
         layout.addWidget(subtitle, 1, 0, 1, 2)
@@ -179,14 +407,16 @@ class TreasuryConsole(QWidget):
         layout.addWidget(lock_button, 2, 1, 1, 1)
         layout.addWidget(pubkey_label, 3, 0, 1, 2)
         layout.addWidget(balance_label, 4, 0, 1, 2)
-        layout.addWidget(endpoint_label, 5, 0, 1, 2)
-        layout.addWidget(generate_button, 6, 0, 1, 1)
-        layout.addWidget(import_button, 6, 1, 1, 1)
-        layout.addWidget(copy_button, 7, 0, 1, 1)
-        layout.addWidget(refresh_balance_button, 7, 1, 1, 1)
-        layout.addWidget(rpc_health_button, 8, 0, 1, 2)
-        layout.addWidget(ensure_ata_button, 9, 0, 1, 1)
-        layout.addWidget(close_ata_button, 9, 1, 1, 1)
+        layout.addWidget(generate_button, 5, 0, 1, 1)
+        layout.addWidget(import_button, 5, 1, 1, 1)
+        layout.addWidget(copy_button, 6, 0, 1, 1)
+        layout.addWidget(refresh_balance_button, 6, 1, 1, 1)
+        layout.addWidget(ata_header, 7, 0, 1, 2)
+        layout.addWidget(ata_summary, 8, 0, 1, 2)
+        layout.addLayout(program_row, 9, 0, 1, 2)
+        layout.addLayout(mint_row, 10, 0, 1, 2)
+        layout.addWidget(ata_table, 11, 0, 1, 2)
+        layout.addLayout(ata_actions, 12, 0, 1, 2)
         layout.setColumnStretch(0, 3)
         layout.setColumnStretch(1, 1)
 
@@ -210,7 +440,12 @@ class TreasuryConsole(QWidget):
         )
 
         for idx, button in enumerate(buttons):
-            button.clicked.connect(lambda _, b=button: self._enqueue_action(b.text()))
+            if button.text() == "Transfer":
+                button.clicked.connect(self._open_transfer_dialog)
+            else:
+                button.clicked.connect(
+                    lambda _, b=button: self._enqueue_action(b.text())
+                )
             row = idx // 3
             col = idx % 3
             grid.addWidget(button, row, col)
@@ -227,9 +462,15 @@ class TreasuryConsole(QWidget):
         activity_list.addItem("Prototype ready. Configure wallet to begin.")
         self.activity_list = activity_list
 
+        retry_button = QPushButton("Retry failed transfers")
+        retry_button.setEnabled(False)
+        retry_button.clicked.connect(self._retry_failed_transfers)
+        self.retry_button = retry_button
+
         column.addWidget(label)
         column.addWidget(helper)
         column.addWidget(activity_list)
+        column.addWidget(retry_button)
         return column
 
     def _network_chip_text(self) -> str:
@@ -247,24 +488,187 @@ class TreasuryConsole(QWidget):
             return "SOL balance: not fetched"
         return f"SOL balance: {self.wallet_state.sol_balance:.6f}"
 
-    def _endpoint_line(self) -> str:
-        latency = (
-            f" · {self.wallet_state.last_latency_ms:.1f} ms"
-            if self.wallet_state.last_latency_ms is not None
-            else ""
+    def _ata_summary_line(self) -> str:
+        count = len(self.wallet_state.associated_accounts_for_network())
+        program = self.wallet_state.token_program
+        return f"ATAs on {self.wallet_state.network}: {count} · Program: {program}"
+
+    def _signature_url(self, signature: str) -> str:
+        cluster = self.wallet_state.network.lower()
+        cluster_param = "" if cluster == "mainnet" else f"?cluster={cluster}"
+        return f"https://explorer.solana.com/tx/{signature}{cluster_param}"
+
+    def _append_activity_line(self, item: QListWidgetItem, message: str) -> None:
+        item.setText(f"{item.text()}\n• {message}")
+
+    def _refresh_ata_table(self) -> None:
+        accounts = self.wallet_controller.list_associated_accounts()
+        self.ata_table.setRowCount(len(accounts))
+        for row, ata in enumerate(accounts):
+            self.ata_table.setItem(row, 0, QTableWidgetItem(ata.mint))
+            self.ata_table.setItem(row, 1, QTableWidgetItem(ata.address))
+            self.ata_table.setItem(row, 2, QTableWidgetItem(ata.token_program))
+            self.ata_table.setItem(row, 3, QTableWidgetItem(f"{ata.balance:.6f}"))
+            reclaim_sol = ata.rent_lamports / LAMPORTS_PER_SOL
+            self.ata_table.setItem(row, 4, QTableWidgetItem(f"{reclaim_sol:.6f}"))
+
+        self.ata_summary_label.setText(self._ata_summary_line())
+
+    def _create_ata_for_mint(self) -> None:
+        mint = self.mint_input.text().strip()
+        if not mint:
+            self._show_error("Mint required", "Enter a mint address to continue.")
+            return
+
+        try:
+            account = self.wallet_controller.ensure_associated_account(mint)
+        except Exception as exc:  # noqa: BLE001 - surface to user
+            self._show_error("ATA creation failed", str(exc))
+            return
+
+        self._refresh_ata_table()
+        self._enqueue_action(
+            f"Ensured ATA for mint {mint} on {self.wallet_state.network}"
         )
-        return f"Endpoint: {self.wallet_controller.endpoint()}{latency}"
+        self._show_message(
+            "ATA ready",
+            (
+                f"Address: {account.address}\n"
+                f"Program: {account.token_program}\n"
+                "Existing accounts remain cached per network for quick review."
+            ),
+        )
+
+    def _close_selected_ata(self) -> None:
+        row = self.ata_table.currentRow()
+        if row < 0:
+            self._show_error("Select an account", "Choose an ATA to close from the list.")
+            return
+
+        address = self.ata_table.item(row, 1).text()
+        account = next(
+            (ata for ata in self.wallet_controller.list_associated_accounts() if ata.address == address),
+            None,
+        )
+        if account is None:
+            self._show_error("Not found", "The selected ATA is no longer tracked.")
+            return
+
+        reclaim_sol = account.rent_lamports / LAMPORTS_PER_SOL
+        force = False
+        if account.balance > 0:
+            warning = QMessageBox.question(
+                self,
+                "Close non-empty ATA?",
+                (
+                    "This account still holds tokens. Closing it will attempt to reclaim rent "
+                    "and may lock remaining tokens. Proceed?"
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if warning != QMessageBox.StandardButton.Yes:
+                return
+            force = True
+        else:
+            preview = QMessageBox.question(
+                self,
+                "Close ATA",
+                f"Reclaim approximately {reclaim_sol:.6f} SOL in rent from this empty ATA?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if preview != QMessageBox.StandardButton.Yes:
+                return
+
+        try:
+            _, reclaimed = self.wallet_controller.close_associated_account(
+                address, force=force
+            )
+        except Exception as exc:  # noqa: BLE001 - surface to user
+            self._show_error("Close failed", str(exc))
+            return
+
+        self._refresh_ata_table()
+        self._enqueue_action(
+            f"Closed ATA {address} on {self.wallet_state.network}"
+        )
+        self._show_message(
+            "Account closed",
+            f"Reclaimed {reclaimed / LAMPORTS_PER_SOL:.6f} SOL in rent refunds.",
+        )
+
+    def _change_token_program(self, program: str) -> None:
+        self.wallet_controller.set_token_program(program)  # type: ignore[arg-type]
+        self.ata_summary_label.setText(self._ata_summary_line())
+        self._enqueue_action(f"Switched token program to {program}")
+
+    def _open_transfer_dialog(self) -> None:
+        dialog = TransferDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        self._process_transfers(dialog.transfers, dialog.rate_limit)
+
+    def _process_transfers(
+        self, transfers: list[TransferRequest], rate_limit: Optional[float]
+    ) -> None:
+        if self.wallet_state.locked or not self.wallet_state.public_key:
+            self._show_error(
+                "Wallet locked", "Import or generate a keypair before transferring."
+            )
+            return
+
+        for transfer in transfers:
+            base = f"Transferring {transfer.amount_sol:.4f} SOL to {transfer.recipient_label}"
+            item = QListWidgetItem(base)
+            self.activity_list.addItem(item)
+
+            try:
+                result = self.wallet_controller.transfer(
+                    transfer.recipient_address,
+                    transfer.amount_sol,
+                    rate_limit_per_sec=rate_limit,
+                    on_progress=lambda msg, it=item: self._append_activity_line(
+                        it, msg
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 - surface failure
+                self._append_activity_line(item, f"✕ Failed: {exc}")
+                self.failed_transfers.append((transfer, rate_limit))
+                self.retry_button.setEnabled(True)
+                continue
+
+            signature_line = (
+                f"Explorer: {self._signature_url(result.signature)}"
+                if result.signature
+                else "Signature unavailable"
+            )
+            self._append_activity_line(
+                item,
+                (
+                    f"✓ Success · fee {result.fee_lamports} lamports\n"
+                    f"Blockhash: {result.blockhash}\n{signature_line}"
+                ),
+            )
+
+    def _retry_failed_transfers(self) -> None:
+        if not self.failed_transfers:
+            self.retry_button.setEnabled(False)
+            return
+
+        pending = self.failed_transfers.copy()
+        self.failed_transfers = []
+        self.retry_button.setEnabled(False)
+        for transfer, rate in pending:
+            self._process_transfers([transfer], rate)
 
     def _handle_network_changed(self, network: str) -> None:
         self.wallet_state.switch_network(network)
-        self.wallet_controller.reset_endpoint_cache()
         self.wallet_state.sol_balance = None
-        self.wallet_state.last_latency_ms = None
         self.network_chip.setText(self._network_chip_text())
         self.wallet_status.setText(self.wallet_state.status_line())
         self.balance_label.setText(self._balance_line())
-        self.endpoint_label.setText(self._endpoint_line())
         self._enqueue_action(f"Switched to {network}")
+        self._refresh_ata_table()
 
     def _toggle_lock(self) -> None:
         self.wallet_state.toggle_lock()
@@ -328,53 +732,6 @@ class TreasuryConsole(QWidget):
         self.wallet_status.setText(self.wallet_state.status_line())
         self.balance_label.setText(self._balance_line())
         self._enqueue_action("Balance refreshed")
-
-    def _check_rpc_health(self) -> None:
-        try:
-            endpoint, latency_ms = self.wallet_controller.check_health()
-        except Exception as exc:  # noqa: BLE001
-            self._show_error("RPC health failed", str(exc))
-            return
-
-        self.endpoint_label.setText(self._endpoint_line())
-        self._enqueue_action(f"Healthy RPC: {endpoint} ({latency_ms:.1f} ms)")
-        self._show_message("RPC healthy", f"Using {endpoint}\nLatency: {latency_ms:.1f} ms")
-
-    def _ensure_treasury_ata(self) -> None:
-        mint, ok = QInputDialog.getText(
-            self,
-            "Mint address",
-            "Enter the SPL mint address to ensure its Treasury ATA exists:",
-        )
-        if not ok or not mint.strip():
-            return
-
-        try:
-            ata_address = self.wallet_controller.ensure_ata(mint.strip())
-        except Exception as exc:  # noqa: BLE001
-            self._show_error("ATA error", str(exc))
-            return
-
-        self._enqueue_action(f"ATA ready: {ata_address}")
-        self._show_message("ATA ready", f"ATA: {ata_address}")
-
-    def _close_ata(self) -> None:
-        ata, ok = QInputDialog.getText(
-            self,
-            "Close ATA",
-            "Enter the ATA address to close (must be empty):",
-        )
-        if not ok or not ata.strip():
-            return
-
-        try:
-            signature = self.wallet_controller.close_empty_ata(ata.strip())
-        except Exception as exc:  # noqa: BLE001
-            self._show_error("Close ATA failed", str(exc))
-            return
-
-        self._enqueue_action(f"Closed ATA {ata.strip()} → {signature}")
-        self._show_message("ATA closed", f"Signature: {signature}")
 
     def _enqueue_action(self, description: str) -> None:
         self.wallet_state.enqueue_action(description)
