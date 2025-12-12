@@ -15,11 +15,52 @@ Network = Literal["Mainnet", "Testnet", "Devnet"]
 TokenProgram = Literal["Token-2022", "Token"]
 NETWORKS: list[Network] = ["Mainnet", "Testnet", "Devnet"]
 
-DEFAULT_ENDPOINTS: dict[Network, str] = {
-    "Mainnet": "https://api.mainnet-beta.solana.com",
-    "Testnet": "https://api.testnet.solana.com",
-    "Devnet": "https://api.devnet.solana.com",
-}
+
+@dataclass
+class EndpointStatus:
+    """Metadata for a single RPC endpoint within a cluster."""
+
+    url: str
+    label: str
+    priority: int = 0
+    healthy: Optional[bool] = None
+    latency_ms: Optional[float] = None
+    last_checked: Optional[float] = None
+
+    def mark_result(self, healthy: bool, latency_ms: Optional[float]) -> None:
+        """Record the outcome of a health probe."""
+
+        self.healthy = healthy
+        self.latency_ms = latency_ms
+        self.last_checked = time.time()
+
+
+def _default_endpoint_matrix() -> dict[Network, list[EndpointStatus]]:
+    """Return the default ordered endpoint list for each supported network."""
+
+    return {
+        "Mainnet": [
+            EndpointStatus(
+                url="https://api.mainnet-beta.solana.com",
+                label="Solana Foundation",  # default public endpoint
+                priority=0,
+            ),
+        ],
+        "Testnet": [
+            EndpointStatus(
+                url="https://api.testnet.solana.com",
+                label="Solana Foundation",  # default public endpoint
+                priority=0,
+            ),
+        ],
+        "Devnet": [
+            EndpointStatus(
+                url="https://api.devnet.solana.com",
+                label="Solana Foundation",  # default public endpoint
+                priority=0,
+            ),
+        ],
+    }
 
 TOKEN_PROGRAM_IDS: dict[TokenProgram, str] = {
     "Token-2022": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
@@ -134,11 +175,26 @@ class WalletController:
     def __init__(self, state: WalletState) -> None:
         self.state = state
         self._keypair: Optional[Keypair] = None
+        self.endpoints: dict[Network, list[EndpointStatus]] = _default_endpoint_matrix()
 
     def set_token_program(self, token_program: TokenProgram) -> None:
         """Update the active token program preference."""
 
         self.state.set_token_program(token_program)
+
+    async def ping_endpoint(self, endpoint: EndpointStatus) -> EndpointStatus:
+        """Lightweight health probe using getLatestBlockhash to measure latency."""
+
+        start = time.perf_counter()
+        try:
+            client = Client(endpoint.url)
+            client.get_latest_blockhash()
+            latency_ms = (time.perf_counter() - start) * 1000
+            endpoint.mark_result(True, latency_ms)
+        except Exception:
+            latency_ms = (time.perf_counter() - start) * 1000
+            endpoint.mark_result(False, latency_ms)
+        return endpoint
 
     def current_token_program_id(self) -> str:
         """Return the on-chain program id for the selected SPL token program."""
@@ -172,7 +228,7 @@ class WalletController:
     def endpoint(self) -> str:
         """Return the RPC endpoint for the active network."""
 
-        return DEFAULT_ENDPOINTS[self.state.network]
+        return self.select_endpoint().url
 
     def refresh_balance(self) -> Optional[float]:
         """Fetch the SOL balance for the active keypair using the configured RPC endpoint."""
@@ -180,11 +236,19 @@ class WalletController:
         if self._keypair is None:
             return None
 
-        client = Client(self.endpoint())
-        response = client.get_balance(Pubkey.from_string(str(self._keypair.pubkey())))
-        lamports = response.value
-        self.state.sol_balance = lamports / LAMPORTS_PER_SOL
-        return self.state.sol_balance
+        endpoint = self.select_endpoint()
+        client = Client(endpoint.url)
+        try:
+            response = client.get_balance(
+                Pubkey.from_string(str(self._keypair.pubkey()))
+            )
+            lamports = response.value
+            self.state.sol_balance = lamports / LAMPORTS_PER_SOL
+            self._mark_endpoint_healthy(endpoint)
+            return self.state.sol_balance
+        except Exception:
+            self.mark_endpoint_failed(endpoint)
+            return None
 
     def fetch_recent_blockhash(self) -> str:
         """Fetch the recent blockhash for transaction building.
@@ -193,24 +257,30 @@ class WalletController:
         access fails, allowing the UI to continue presenting transfer flows.
         """
 
-        client = Client(self.endpoint())
+        endpoint = self.select_endpoint()
+        client = Client(endpoint.url)
         try:
             response = client.get_latest_blockhash()
+            self._mark_endpoint_healthy(endpoint)
             return str(response.value.blockhash)
         except Exception:
+            self.mark_endpoint_failed(endpoint)
             # Keep the UI responsive even when offline.
             return secrets.token_hex(16)
 
     def estimate_fee(self, instructions: int = 1) -> int:
         """Roughly estimate the lamports required for a transfer."""
 
-        client = Client(self.endpoint())
+        endpoint = self.select_endpoint()
+        client = Client(endpoint.url)
         try:
             fees = client.get_fees()
             # Prefer the RPC value if available; fall back to a nominal fee.
             lamports_per_sig = fees.value.fee_calculator.lamports_per_signature
+            self._mark_endpoint_healthy(endpoint)
         except Exception:
             lamports_per_sig = 5000
+            self.mark_endpoint_failed(endpoint)
 
         # Assume one signature and a small bump for multiple instructions.
         return lamports_per_sig * max(1, instructions)
@@ -349,3 +419,27 @@ class WalletController:
         self.state.public_key = str(keypair.pubkey())
         self.state.locked = False
         self.state.sol_balance = None
+
+    def select_endpoint(self, network: Optional[Network] = None) -> EndpointStatus:
+        """Pick the best endpoint based on health and priority."""
+
+        network_endpoints = self.endpoints.get(network or self.state.network, [])
+        if not network_endpoints:
+            raise RuntimeError("No endpoints configured for the requested network")
+
+        # Prefer healthy endpoints, then unknown, then unhealthy; lowest priority wins.
+        def sort_key(ep: EndpointStatus) -> tuple[int, int]:
+            health_rank = 0 if ep.healthy else (1 if ep.healthy is None else 2)
+            return (health_rank, ep.priority)
+
+        return sorted(network_endpoints, key=sort_key)[0]
+
+    def mark_endpoint_failed(self, endpoint: EndpointStatus) -> None:
+        """Mark an endpoint as unhealthy after an error."""
+
+        endpoint.mark_result(False, None)
+
+    def _mark_endpoint_healthy(self, endpoint: EndpointStatus) -> None:
+        """Refresh basic metadata for a successful request."""
+
+        endpoint.mark_result(True, endpoint.latency_ms)
