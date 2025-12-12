@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .components import MintSettingsPanel
 from .theme import BACKGROUND, FONT_FAMILY, FONT_SIZE, PALETTE, SURFACE, SURFACE_ALT, TEXT_MUTED, TEXT_PRIMARY, muted
 from .network_monitor import NetworkMonitor
 from .wallet import (
@@ -304,6 +305,7 @@ class TreasuryConsole(QWidget):
 
         layout.addLayout(self._network_row())
         layout.addLayout(self._wallet_card())
+        layout.addWidget(self._mint_panel())
         layout.addLayout(self._actions_grid())
         layout.addLayout(self._history_panel())
         layout.addLayout(self._activity_panel())
@@ -430,6 +432,18 @@ class TreasuryConsole(QWidget):
         card.setLayout(layout)
         row.addWidget(card)
         return row
+
+    def _mint_panel(self) -> QWidget:
+        def on_payload_ready(payload: dict) -> None:
+            self._handle_mint_payload(payload)
+
+        panel = MintSettingsPanel(
+            wallet_controller=self.wallet_controller,
+            wallet_state=self.wallet_state,
+            on_payload_ready=on_payload_ready,
+            on_activity=lambda msg: self._enqueue_action(f"Mint: {msg}"),
+        )
+        return panel
 
     def _actions_grid(self) -> QGridLayout:
         grid = QGridLayout()
@@ -616,6 +630,26 @@ class TreasuryConsole(QWidget):
 
         self.ata_summary_label.setText(self._ata_summary_line())
         self.active_mint_label.setText(self._active_mint_line())
+
+    def _handle_mint_payload(self, payload: dict) -> None:
+        mint = payload.get("mint", "unknown")
+        mode = payload.get("mode", "create")
+        self.wallet_state.set_active_mint(mint)
+        if hasattr(self, "active_mint_label"):
+            self.active_mint_label.setText(self._active_mint_line())
+
+        parts = [f"Mint {mode} requested"]
+        if payload.get("transfer_hook"):
+            parts.append("transfer hook")
+        if payload.get("close_authority"):
+            parts.append("close authority")
+        if payload.get("interest_bearing"):
+            parts.append("interest-bearing")
+
+        self._enqueue_action(
+            f"Mint payload for {mint}: {', '.join(parts)} (program {payload.get('token_program')})"
+        )
+        self._show_message("Mint payload ready", "Review payload details in activity log.")
 
     def _load_history(self, load_more: bool = False) -> None:
         if self.wallet_state.locked or not self.wallet_state.public_key:
