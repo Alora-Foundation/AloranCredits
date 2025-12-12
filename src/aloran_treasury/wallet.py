@@ -72,6 +72,58 @@ DEFAULT_RENT_EXEMPT_LAMPORTS = 2_039_280
 LAMPORTS_PER_SOL = 1_000_000_000
 
 
+def _program_id(token_program: TokenProgram) -> str:
+    """Return the canonical program id for the given token program."""
+
+    try:
+        return TOKEN_PROGRAM_IDS[token_program]
+    except KeyError as exc:  # pragma: no cover - defensive against unexpected values
+        raise ValueError(f"Unknown token program: {token_program}") from exc
+
+
+def _require_token_2022(token_program: TokenProgram) -> None:
+    """Raise an explicit error when an extension is requested on legacy SPL Token."""
+
+    if token_program != "Token-2022":
+        raise TokenProgramUnsupportedError(token_program)
+
+
+class TokenProgramUnsupportedError(RuntimeError):
+    """Raised when callers request token-2022-only behavior against the legacy program."""
+
+    def __init__(self, program: str) -> None:
+        super().__init__(f"Token program {program} does not support token-2022 extensions")
+        self.program = program
+
+
+@dataclass
+class InstructionStep:
+    """Lightweight placeholder for an instruction plan used by the UI preview flows."""
+
+    name: str
+    program_id: str
+    accounts: list[str] = field(default_factory=list)
+    data: dict[str, object] = field(default_factory=dict)
+    signers: list[str] = field(default_factory=list)
+
+
+@dataclass
+class TransferHookConfig:
+    """Configuration required to enable transfer hooks on a new mint."""
+
+    hook_program: str
+    validation_accounts: Optional[list[str]] = None
+
+
+@dataclass
+class InterestBearingConfig:
+    """Parameters for initializing an interest-bearing token-2022 mint."""
+
+    rate_basis_points: int
+    authority: str
+    initialization_data: Optional[dict[str, object]] = None
+
+
 @dataclass
 class TransferRequest:
     """Single transfer entry used by the UI and controller."""
@@ -167,6 +219,180 @@ class WalletState:
         """Record a future action in the activity list."""
 
         self.pending_actions.append(description)
+
+
+def create_mint_instructions(
+    *,
+    token_program: TokenProgram,
+    mint_address: str,
+    decimals: int,
+    mint_authority: str,
+    freeze_authority: Optional[str] = None,
+    transfer_hook: Optional[TransferHookConfig] = None,
+    mint_close_authority: Optional[str] = None,
+    interest_bearing: Optional[InterestBearingConfig] = None,
+) -> list[InstructionStep]:
+    """Build a deterministic instruction plan for mint creation.
+
+    The helpers intentionally model the shape and ordering of Token-2022
+    extension initialization without performing RPCs. Each extension is
+    appended in the order provided: transfer hooks, mint close authority,
+    then interest-bearing configuration.
+    """
+
+    program_id = _program_id(token_program)
+
+    if token_program == "Token" and any(
+        [transfer_hook, mint_close_authority, interest_bearing]
+    ):
+        raise TokenProgramUnsupportedError(token_program)
+
+    instructions: list[InstructionStep] = [
+        InstructionStep(
+            name="initialize_mint",
+            program_id=program_id,
+            accounts=[mint_address],
+            data={
+                "decimals": decimals,
+                "mint_authority": mint_authority,
+                "freeze_authority": freeze_authority,
+            },
+            signers=[mint_authority],
+        )
+    ]
+
+    if transfer_hook:
+        instructions.append(
+            InstructionStep(
+                name="initialize_transfer_hook_extension",
+                program_id=program_id,
+                accounts=[mint_address],
+                data={"hook_program": transfer_hook.hook_program},
+                signers=[mint_authority],
+            )
+        )
+        instructions.append(
+            InstructionStep(
+                name="configure_transfer_hook",
+                program_id=program_id,
+                accounts=[mint_address, *(transfer_hook.validation_accounts or [])],
+                data={
+                    "hook_program": transfer_hook.hook_program,
+                    "validation_accounts": transfer_hook.validation_accounts
+                    or [],
+                },
+                signers=[mint_authority],
+            )
+        )
+
+    if mint_close_authority:
+        instructions.append(
+            InstructionStep(
+                name="initialize_mint_close_authority_extension",
+                program_id=program_id,
+                accounts=[mint_address],
+                signers=[mint_authority],
+            )
+        )
+        instructions.append(
+            InstructionStep(
+                name="set_mint_close_authority",
+                program_id=program_id,
+                accounts=[mint_address],
+                data={"close_authority": mint_close_authority},
+                signers=[mint_authority],
+            )
+        )
+
+    if interest_bearing:
+        instructions.append(
+            InstructionStep(
+                name="initialize_interest_bearing_extension",
+                program_id=program_id,
+                accounts=[mint_address],
+                data=interest_bearing.initialization_data or {},
+                signers=[interest_bearing.authority],
+            )
+        )
+        instructions.append(
+            InstructionStep(
+                name="set_interest_rate",
+                program_id=program_id,
+                accounts=[mint_address],
+                data={
+                    "rate_basis_points": interest_bearing.rate_basis_points,
+                    "authority": interest_bearing.authority,
+                },
+                signers=[interest_bearing.authority],
+            )
+        )
+
+    return instructions
+
+
+def set_transfer_hook(
+    *,
+    token_program: TokenProgram,
+    mint_address: str,
+    authority: str,
+    hook_program: str,
+    validation_accounts: Optional[list[str]] = None,
+) -> InstructionStep:
+    """Return a configuration instruction for transfer hook updates."""
+
+    _require_token_2022(token_program)
+    return InstructionStep(
+        name="set_transfer_hook",
+        program_id=_program_id(token_program),
+        accounts=[mint_address, *(validation_accounts or [])],
+        data={
+            "hook_program": hook_program,
+            "validation_accounts": validation_accounts or [],
+        },
+        signers=[authority],
+    )
+
+
+def set_mint_close_authority(
+    *,
+    token_program: TokenProgram,
+    mint_address: str,
+    authority: str,
+    close_authority: Optional[str],
+) -> InstructionStep:
+    """Return a configuration instruction to update the mint close authority."""
+
+    _require_token_2022(token_program)
+    return InstructionStep(
+        name="set_mint_close_authority",
+        program_id=_program_id(token_program),
+        accounts=[mint_address],
+        data={"close_authority": close_authority},
+        signers=[authority],
+    )
+
+
+def set_interest_rate(
+    *,
+    token_program: TokenProgram,
+    mint_address: str,
+    authority: str,
+    rate_basis_points: int,
+    initialization_data: Optional[dict[str, object]] = None,
+) -> InstructionStep:
+    """Return an interest-bearing mint rate update instruction."""
+
+    _require_token_2022(token_program)
+    return InstructionStep(
+        name="set_interest_rate",
+        program_id=_program_id(token_program),
+        accounts=[mint_address],
+        data={
+            "rate_basis_points": rate_basis_points,
+            "initialization_data": initialization_data or {},
+        },
+        signers=[authority],
+    )
 
 
 class WalletController:
