@@ -1,0 +1,10 @@
+{
+  "name": "alorancredits",
+  "version": "1.0.0",
+  "description": "Product notes and prototype code for the Aloran Treasury Console prototype.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
+  "license": "ISC"
+}

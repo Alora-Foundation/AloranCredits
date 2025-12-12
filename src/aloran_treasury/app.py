@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 from .components import MintSettingsPanel
 from .theme import BACKGROUND, FONT_FAMILY, FONT_SIZE, PALETTE, SURFACE, SURFACE_ALT, TEXT_MUTED, TEXT_PRIMARY, muted
 from .network_monitor import NetworkMonitor
+from .lock_manager import LockManager
 from .wallet import (
     LAMPORTS_PER_SOL,
     NETWORKS,
@@ -283,15 +284,20 @@ class TransferDialog(QDialog):
 class TreasuryConsole(QWidget):
     def __init__(self) -> None:
         super().__init__()
+        self.lock_manager = LockManager(Path.home() / ".aloran_treasury" / "keystore.json", inactivity_seconds=300)
+        self.installEventFilter(self)
         self.wallet_state = WalletState()
         self.wallet_state.subscribe_endpoint_updates(self._update_network_chip)
-        self.wallet_controller = WalletController(self.wallet_state)
+        self.wallet_controller = WalletController(self.wallet_state, lock_manager=self.lock_manager)
         self.setWindowTitle("Aloran Treasury Console (Prototype)")
         self.setMinimumSize(720, 720)
         self.failed_transfers: list[tuple[TransferRequest, Optional[float]]] = []
         self.history_entries: list[TransactionHistoryEntry] = []
         self.history_cursor: Optional[str] = None
+        self.lock_manager.subscribe_unlock(self._on_unlock_event)
+        self.lock_manager.subscribe_lock(self._on_lock_event)
         self._build()
+        self._bootstrap_keystore()
         self._refresh_ata_table()
         self.network_monitor = NetworkMonitor(self.wallet_state, interval_seconds=20, parent=self)
         self.network_monitor.start()
@@ -1107,12 +1113,11 @@ class TreasuryConsole(QWidget):
         self._enqueue_action("Wallet unlocked")
 
     def _toggle_lock(self) -> None:
-        if self.wallet_state.locked:
+        if self.lock_manager.locked:
+            self._prompt_unlock()
             return
-        self.wallet_controller.lock_wallet()
-        self.wallet_status.setText(self.wallet_state.status_line())
-        self._update_lock_ui()
-        self._enqueue_action("Wallet locked")
+
+        self.lock_manager.lock("manual")
 
     def _generate_keypair(self) -> None:
         secret = self.wallet_controller.generate_ephemeral()
@@ -1173,6 +1178,7 @@ class TreasuryConsole(QWidget):
         self._enqueue_action("Balance refreshed")
 
     def _enqueue_action(self, description: str) -> None:
+        self.lock_manager.register_activity()
         self.wallet_state.enqueue_action(description)
         item = QListWidgetItem(description)
         self.activity_list.addItem(item)
@@ -1182,6 +1188,48 @@ class TreasuryConsole(QWidget):
 
     def _show_message(self, title: str, message: str) -> None:
         QMessageBox.information(self, title, message)
+
+    def _on_unlock_event(self, _: object) -> None:
+        self.wallet_status.setText(self.wallet_state.status_line())
+        self.lock_button.setText("Lock")
+
+    def _on_lock_event(self) -> None:
+        self.wallet_status.setText(self.wallet_state.status_line())
+        self.lock_button.setText("Unlock")
+
+    def _bootstrap_keystore(self) -> None:
+        if self.lock_manager.has_keystore:
+            self.wallet_state.locked = True
+            self.wallet_status.setText(self.wallet_state.status_line())
+            self._prompt_unlock()
+        else:
+            self.wallet_status.setText(self.wallet_state.status_line())
+
+    def _prompt_unlock(self) -> None:
+        passphrase, ok = QInputDialog.getText(
+            self,
+            "Unlock wallet",
+            "Enter passphrase for your keystore",
+            QLineEdit.EchoMode.Password,
+        )
+        if not ok or not passphrase:
+            return
+        try:
+            self.lock_manager.unlock(passphrase)
+            self.lock_manager.register_activity()
+        except ValueError as exc:  # noqa: BLE001 - surface decryption failures
+            self._show_error("Unlock failed", str(exc))
+        except RuntimeError as exc:
+            self._show_error("No keystore", str(exc))
+
+    def eventFilter(self, obj, event):  # type: ignore[override]
+        if event.type() in {
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.KeyPress,
+            QEvent.Type.Wheel,
+        }:
+            self.lock_manager.register_activity()
+        return super().eventFilter(obj, event)
 
 
 def build_window() -> QWidget:

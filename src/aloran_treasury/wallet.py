@@ -11,6 +11,8 @@ from solana.rpc.api import Client
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 
+from .lock_manager import LockManager
+
 Network = Literal["Mainnet", "Testnet", "Devnet"]
 TokenProgram = Literal["Token-2022", "Token"]
 NETWORKS: list[Network] = ["Mainnet", "Testnet", "Devnet"]
@@ -521,8 +523,9 @@ def set_interest_rate(
 class WalletController:
     """Manage the active keypair and lightweight RPC queries."""
 
-    def __init__(self, state: WalletState) -> None:
+    def __init__(self, state: WalletState, lock_manager: Optional[LockManager] = None) -> None:
         self.state = state
+        self.lock_manager = lock_manager
         self._keypair: Optional[Keypair] = None
         self.endpoints: dict[Network, list[EndpointStatus]] = _default_endpoint_matrix()
         self._demo_passphrase = "treasury"
@@ -532,6 +535,10 @@ class WalletController:
         """Return the placeholder passphrase used for the prototype."""
 
         return self._demo_passphrase
+
+        if self.lock_manager:
+            self.lock_manager.subscribe_unlock(self._receive_unlock)
+            self.lock_manager.subscribe_lock(self._receive_lock)
 
     def set_token_program(self, token_program: TokenProgram) -> None:
         """Update the active token program preference."""
@@ -1108,12 +1115,28 @@ class WalletController:
         return normalized
 
     def _apply_keypair(self, keypair: Keypair) -> None:
+        if self.lock_manager:
+            self.lock_manager.unlock_with_keypair(keypair)
+            return
+
         self._keypair = keypair
         self.state.public_key = str(keypair.pubkey())
         self.state.locked = False
         self.state.sol_balance = None
         self.state.decrypting = False
         self.state.unlock_error = None
+
+    def _receive_unlock(self, keypair: Keypair) -> None:
+        self._keypair = keypair
+        self.state.public_key = str(keypair.pubkey())
+        self.state.locked = False
+        self.state.sol_balance = None
+
+    def _receive_lock(self) -> None:
+        self._keypair = None
+        self.state.public_key = None
+        self.state.locked = True
+        self.state.sol_balance = None
 
     def select_endpoint(self, network: Optional[Network] = None) -> EndpointStatus:
         """Pick the best endpoint based on health and priority."""
