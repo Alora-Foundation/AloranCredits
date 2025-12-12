@@ -192,6 +192,10 @@ class MintSettingsPanel(QFrame):
         buttons_row.addWidget(update_button)
         buttons_row.addStretch()
 
+        lock_notice = QLabel("Unlock the wallet to build signing payloads.")
+        lock_notice.setObjectName("muted")
+        lock_notice.hide()
+
         form.addRow("Transfer hook", transfer_row)
         form.addRow("Close authority", close_row)
         form.addRow("Interest", interest_row)
@@ -203,6 +207,7 @@ class MintSettingsPanel(QFrame):
         layout.addWidget(self.extension_summary)
         layout.addLayout(form)
         layout.addLayout(buttons_row)
+        layout.addWidget(lock_notice)
 
         self.setLayout(layout)
 
@@ -215,6 +220,9 @@ class MintSettingsPanel(QFrame):
         self.interest_checkbox = interest_checkbox
         self.interest_rate_input = interest_rate
         self.interest_authority_input = interest_authority
+        self.create_button = create_button
+        self.update_button = update_button
+        self.lock_notice = lock_notice
 
         self._toggle_transfer_hook_fields()
         self._toggle_close_fields()
@@ -343,7 +351,17 @@ class MintSettingsPanel(QFrame):
             interest_authority=authority,
         )
 
+    def set_locked(self, locked: bool) -> None:
+        """Disable signing actions when the wallet is locked."""
+
+        self.create_button.setEnabled(not locked)
+        self.update_button.setEnabled(not locked)
+        self.lock_notice.setVisible(locked)
+
     def _submit_payload(self, mode: str) -> None:
+        if self.wallet_state.locked:
+            self._emit_activity("Unlock wallet to prepare mint payloads.")
+            return
         try:
             state = self._collect_form_state()
         except ValueError as exc:

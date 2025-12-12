@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 from typing import Iterable, List, Optional
 
-from PySide6.QtCore import QUrl, Qt
+from PySide6.QtCore import QTimer, QUrl, Qt
 from PySide6.QtGui import QColor, QDesktopServices, QPalette
 from PySide6.QtWidgets import (
     QApplication,
@@ -348,10 +348,44 @@ class TreasuryConsole(QWidget):
         wallet_status = QLabel(self.wallet_state.status_line())
         wallet_status.setStyleSheet("font-size: 12pt; font-weight: 600;")
 
+        lock_banner = QLabel(
+            "Wallet is locked. Sensitive details are hidden until you unlock."
+        )
+        lock_banner.setWordWrap(True)
+        lock_banner.setStyleSheet(
+            (
+                f"padding: 8px; border-radius: 8px;"
+                f"border: 1px solid {PALETTE['medium_blue']};"
+                f"background-color: {PALETTE['dark_blue']};"
+                "font-weight: 600;"
+            )
+        )
+        lock_banner.hide()
+
         pubkey_label = QLabel(self._public_key_line())
         pubkey_label.setObjectName("muted")
         balance_label = QLabel(self._balance_line())
         balance_label.setObjectName("muted")
+
+        unlock_row = QHBoxLayout()
+        passphrase_label = QLabel("Wallet passphrase")
+        passphrase_label.setObjectName("muted")
+        passphrase_input = QLineEdit()
+        passphrase_input.setEchoMode(QLineEdit.EchoMode.Password)
+        passphrase_input.setPlaceholderText(
+            f"Prototype passphrase: {self.wallet_controller.demo_passphrase}"
+        )
+        unlock_button = QPushButton("Unlock")
+        unlock_button.clicked.connect(self._unlock_with_passphrase)
+        unlock_row.addWidget(passphrase_label)
+        unlock_row.addWidget(passphrase_input)
+        unlock_row.addWidget(unlock_button)
+        unlock_row.addStretch()
+
+        unlock_error = QLabel("")
+        unlock_error.setObjectName("muted")
+        unlock_error.setStyleSheet("color: #ff8a80;")
+        unlock_error.hide()
 
         ata_header = QLabel("Associated Token Accounts")
         ata_header.setStyleSheet("font-size: 12pt; font-weight: 700;")
@@ -428,26 +462,34 @@ class TreasuryConsole(QWidget):
         self.program_select = program_select
         self.ata_summary_label = ata_summary
         self.token_support_banner = compatibility_banner
+        self.lock_banner = lock_banner
+        self.passphrase_input = passphrase_input
+        self.unlock_button = unlock_button
+        self.unlock_error = unlock_error
 
         self._update_token_support_banner()
+        self._update_lock_ui()
 
         layout.addWidget(title, 0, 0, 1, 2)
         layout.addWidget(subtitle, 1, 0, 1, 2)
         layout.addWidget(wallet_status, 2, 0, 1, 1)
         layout.addWidget(lock_button, 2, 1, 1, 1)
-        layout.addWidget(pubkey_label, 3, 0, 1, 2)
-        layout.addWidget(balance_label, 4, 0, 1, 2)
-        layout.addWidget(generate_button, 5, 0, 1, 1)
-        layout.addWidget(import_button, 5, 1, 1, 1)
-        layout.addWidget(copy_button, 6, 0, 1, 1)
-        layout.addWidget(refresh_balance_button, 6, 1, 1, 1)
-        layout.addWidget(ata_header, 7, 0, 1, 2)
-        layout.addWidget(ata_summary, 8, 0, 1, 2)
-        layout.addWidget(compatibility_banner, 9, 0, 1, 2)
-        layout.addLayout(program_row, 10, 0, 1, 2)
-        layout.addLayout(mint_row, 11, 0, 1, 2)
-        layout.addWidget(ata_table, 12, 0, 1, 2)
-        layout.addLayout(ata_actions, 13, 0, 1, 2)
+        layout.addWidget(lock_banner, 3, 0, 1, 2)
+        layout.addLayout(unlock_row, 4, 0, 1, 2)
+        layout.addWidget(unlock_error, 5, 0, 1, 2)
+        layout.addWidget(pubkey_label, 6, 0, 1, 2)
+        layout.addWidget(balance_label, 7, 0, 1, 2)
+        layout.addWidget(generate_button, 8, 0, 1, 1)
+        layout.addWidget(import_button, 8, 1, 1, 1)
+        layout.addWidget(copy_button, 9, 0, 1, 1)
+        layout.addWidget(refresh_balance_button, 9, 1, 1, 1)
+        layout.addWidget(ata_header, 10, 0, 1, 2)
+        layout.addWidget(ata_summary, 11, 0, 1, 2)
+        layout.addWidget(compatibility_banner, 12, 0, 1, 2)
+        layout.addLayout(program_row, 13, 0, 1, 2)
+        layout.addLayout(mint_row, 14, 0, 1, 2)
+        layout.addWidget(ata_table, 15, 0, 1, 2)
+        layout.addLayout(ata_actions, 16, 0, 1, 2)
         layout.setColumnStretch(0, 3)
         layout.setColumnStretch(1, 1)
 
@@ -465,6 +507,7 @@ class TreasuryConsole(QWidget):
             on_payload_ready=on_payload_ready,
             on_activity=lambda msg: self._enqueue_action(f"Mint: {msg}"),
         )
+        self.mint_panel = panel
         return panel
 
     def _actions_grid(self) -> QGridLayout:
@@ -481,6 +524,7 @@ class TreasuryConsole(QWidget):
                 "Metadata",
             ]
         )
+        self.action_buttons = buttons
 
         for idx, button in enumerate(buttons):
             if button.text() == "Transfer":
@@ -492,6 +536,8 @@ class TreasuryConsole(QWidget):
             row = idx // 3
             col = idx % 3
             grid.addWidget(button, row, col)
+
+        self._update_lock_ui()
 
         return grid
 
@@ -611,6 +657,8 @@ class TreasuryConsole(QWidget):
         self.network_chip.setStyleSheet(self._network_chip_style())
 
     def _public_key_line(self) -> str:
+        if self.wallet_state.locked:
+            return "Public key: hidden until unlocked"
         return (
             f"Public key: {self.wallet_state.public_key}"
             if self.wallet_state.public_key
@@ -618,6 +666,8 @@ class TreasuryConsole(QWidget):
         )
 
     def _balance_line(self) -> str:
+        if self.wallet_state.locked:
+            return "SOL balance: hidden until unlocked"
         if self.wallet_state.sol_balance is None:
             return "SOL balance: not fetched"
         return f"SOL balance: {self.wallet_state.sol_balance:.6f}"
@@ -683,10 +733,44 @@ class TreasuryConsole(QWidget):
             self.program_select.setCurrentText("Token")
             self.program_select.blockSignals(False)
 
+    def _update_lock_ui(self) -> None:
+        locked = self.wallet_state.locked
+        decrypting = self.wallet_state.decrypting
+        self.lock_banner.setVisible(locked)
+        self.passphrase_input.setVisible(locked)
+        self.unlock_button.setVisible(locked)
+        self.unlock_error.setVisible(bool(self.wallet_state.unlock_error) and locked)
+        self.unlock_error.setText(self.wallet_state.unlock_error or "")
+
+        self.passphrase_input.setEnabled(not decrypting)
+        self.unlock_button.setEnabled(not decrypting)
+        self.unlock_button.setText("Decrypting…" if decrypting else "Unlock")
+        self.lock_button.setText("Lock" if not locked else "Locked")
+        self.lock_button.setEnabled(not locked)
+
+        for button in getattr(self, "action_buttons", []):
+            button.setEnabled(not locked)
+            if locked:
+                button.setToolTip("Unlock the wallet to sign or broadcast actions.")
+            else:
+                button.setToolTip("")
+
+        if hasattr(self, "mint_panel") and isinstance(self.mint_panel, MintSettingsPanel):
+            self.mint_panel.set_locked(locked)
+
+        self.public_key_label.setText(self._public_key_line())
+        self.balance_label.setText(self._balance_line())
+
     def _guard_token_program_submission(self) -> bool:
         if self.wallet_controller.token_program_supported(self.wallet_state.token_program):
             return True
         self._show_error("Token-2022 unsupported", self._token_program_blocked_message())
+        return False
+
+    def _require_unlocked(self, action: str) -> bool:
+        if not self.wallet_state.locked:
+            return True
+        self._show_error("Wallet locked", f"Unlock the wallet to {action}.")
         return False
 
     def _append_activity_line(self, item: QListWidgetItem, message: str) -> None:
@@ -814,6 +898,9 @@ class TreasuryConsole(QWidget):
             self._show_error("Mint required", "Enter a mint address to continue.")
             return
 
+        if not self._require_unlocked("create or lookup token accounts"):
+            return
+
         if not self._guard_token_program_submission():
             return
 
@@ -840,6 +927,9 @@ class TreasuryConsole(QWidget):
         row = self.ata_table.currentRow()
         if row < 0:
             self._show_error("Select an account", "Choose an ATA to close from the list.")
+            return
+
+        if not self._require_unlocked("close token accounts"):
             return
 
         address = self.ata_table.item(row, 1).text()
@@ -911,6 +1001,8 @@ class TreasuryConsole(QWidget):
         self._update_token_support_banner()
 
     def _open_transfer_dialog(self) -> None:
+        if not self._require_unlocked("prepare transfers"):
+            return
         dialog = TransferDialog(self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -920,10 +1012,12 @@ class TreasuryConsole(QWidget):
     def _process_transfers(
         self, transfers: list[TransferRequest], rate_limit: Optional[float]
     ) -> None:
-        if self.wallet_state.locked or not self.wallet_state.public_key:
-            self._show_error(
-                "Wallet locked", "Import or generate a keypair before transferring."
-            )
+        if not self._require_unlocked("transfer funds") or not self.wallet_state.public_key:
+            if not self.wallet_state.public_key:
+                self._show_error(
+                    "Wallet missing",
+                    "Import or generate a keypair before transferring.",
+                )
             return
 
         if not self._guard_token_program_submission():
@@ -990,6 +1084,34 @@ class TreasuryConsole(QWidget):
             self.network_monitor.force_poll()
         self._refresh_ata_table()
 
+    def _unlock_with_passphrase(self) -> None:
+        if self.wallet_state.decrypting:
+            return
+
+        self.wallet_state.decrypting = True
+        self.wallet_state.unlock_error = None
+        self.wallet_status.setText("Decrypting…")
+        self._update_lock_ui()
+        passphrase = self.passphrase_input.text()
+        QTimer.singleShot(300, lambda: self._complete_unlock(passphrase))
+
+    def _complete_unlock(self, passphrase: str) -> None:
+        try:
+            self.wallet_controller.unlock_wallet(passphrase)
+        except Exception as exc:  # noqa: BLE001 - surface error state
+            self.wallet_state.decrypting = False
+            self.wallet_state.locked = True
+            self.wallet_state.unlock_error = str(exc)
+            self.wallet_status.setText(self.wallet_state.status_line())
+            self._update_lock_ui()
+            return
+
+        self.wallet_state.decrypting = False
+        self.passphrase_input.clear()
+        self.wallet_status.setText(self.wallet_state.status_line())
+        self._update_lock_ui()
+        self._enqueue_action("Wallet unlocked")
+
     def _toggle_lock(self) -> None:
         if self.lock_manager.locked:
             self._prompt_unlock()
@@ -1002,7 +1124,7 @@ class TreasuryConsole(QWidget):
         self.wallet_status.setText(self.wallet_state.status_line())
         self.public_key_label.setText(self._public_key_line())
         self.balance_label.setText(self._balance_line())
-        self.lock_button.setText("Lock")
+        self._update_lock_ui()
         self._enqueue_action("Generated new session keypair")
 
         QApplication.clipboard().setText(secret)
@@ -1026,7 +1148,7 @@ class TreasuryConsole(QWidget):
         self.wallet_status.setText(self.wallet_state.status_line())
         self.public_key_label.setText(self._public_key_line())
         self.balance_label.setText(self._balance_line())
-        self.lock_button.setText("Lock")
+        self._update_lock_ui()
         self._enqueue_action("Imported treasury key")
         self._show_message("Secret imported", "Key loaded into session.")
 
@@ -1039,6 +1161,8 @@ class TreasuryConsole(QWidget):
         self._enqueue_action("Copied public key")
 
     def _refresh_balance(self) -> None:
+        if not self._require_unlocked("refresh balances"):
+            return
         try:
             balance = self.wallet_controller.refresh_balance()
         except Exception as exc:  # noqa: BLE001 - surface RPC errors
